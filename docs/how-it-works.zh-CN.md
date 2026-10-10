@@ -174,3 +174,32 @@ if (TDJ_MODE) {
   游戏运行正常；
 * 122 个显示模式枚举在 TDJ 下全部报 120Hz（判定在枚举之前完成，模式表一致）；
 * 两条路径（命令行 `-iidxtdj` / spicecfg 勾选）都验证过；`FPS=auto` 不再需要手动写 `FPS=120`。
+
+### 一份真实的自检通过记录（TDJ，spicecfg 勾选）
+
+这是玩家机器上 `iidxfps_report.txt` 的原始内容（v1.0.2，240Hz 桌面，全屏，IIDX 33）：
+
+```
+iidxfps 1.0.2 - beatmania IIDX frame timing report
+config   : Enabled=1 FPS=auto target=120 ...
+desktop  : 240Hz   game is told 120Hz
+cabinet  : auto -> cmdline=no spicecfg=TDJ romfiles=no game rom="TDJ-JA"
+pacing   : ENABLED (QPC schedule, vsync off)   pacePoint=draw   deviceHooked=1
+frames/s : draw=119.90 swapchain=119.90 present=0.00 paced=122 late=7 skipped=0
+frame gap: 7.143 .. 9.449 ms
+--- last messages ---
+[16] 19:49:39 fps(draw)=45.20  gap=7.163..182.207 ms     <- 自检/资源加载开始阻塞
+[17] 19:49:40 fps(draw)=0.00
+[18] 19:49:41 fps(draw)=0.00
+[19] 19:49:42 fps(draw)=0.00
+[20] 19:49:43 fps(draw)=0.00
+[21] 19:49:44 fps(draw)=50.06  gap=7.056..5003.306 ms    <- 5 秒阻塞结束
+[22] 19:49:45 fps(draw)=119.90
+```
+
+两个值得注意的点：
+
+1. `spicecfg=TDJ` 说明判定走的是 **spicecfg 配置文件**这条路径（用户是在界面里勾选的，
+   进程命令行里没有 `-iidxtdj`），而 `game rom="TDJ-JA"` 是 AVS 读取的兜底信号，两者一致；
+2. 第 16~21 行是**自检所在的那段 5 秒阻塞**。关键在于阻塞开始之前就已经稳定在 119.9 帧、
+   而且显示模式表也是在判定之后才枚举的（第 5 节那个坑），所以自检测量到的是正确的 120 帧。
