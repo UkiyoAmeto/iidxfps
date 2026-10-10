@@ -59,11 +59,32 @@ the DLL, keeping the name `iidxfps.ini`. The important keys:
 
 | Key | Meaning |
 |---|---|
-| `FPS=auto\|60\|120` | Target rate. `auto` detects the TDJ/LDJ cabinet the same way spice2x does. **If your LDJ build has the `Force LDJ Custom Timing/Adapter FPS = 120` patch, set `FPS=120`**, otherwise the module will hold it to 60 and the game runs at half speed |
+| `FPS=auto\|60\|120` | Target rate. `auto` detects the cabinet (see below). **If your LDJ build has the `Force LDJ Custom Timing/Adapter FPS = 120` patch, set `FPS=120`**, otherwise the module will hold it to 60 and the game runs at half speed |
 | `PaceAt=auto\|draw\|swapchain\|present` | Where the loop is held back; `auto` picks whichever point is actually being called (for this game: spice's draw callback, once per game frame) |
 | `ForceImmediatePresent=1` | Required, otherwise vsync keeps the loop at the display refresh rate |
 | `SkipWhenRefreshMatches=1` | Do nothing at all when the refresh rate already equals the target (avoids introducing tearing on setups that were fine) |
 | `MeasureOnly=1` | Diagnostics: install no hooks, only measure what the game does on its own |
+
+### How `FPS=auto` decides between TDJ and LDJ
+
+Three signals are tried in order; any of them means TDJ (120 fps):
+
+1. **the launcher command line** containing `iidxtdj` (`-iidxtdj`, `-iidxtdjw`, `-iidxtdjsubsize` …
+   every TDJ-only option contains that string, none of them exists for LDJ). This is known
+   instantly, so the whole display mode table and the refresh spoof are consistent from the first
+   frame on;
+2. `C:\000rom.txt` containing `TDJ-JA`, or `D:\001rom.txt` containing `TDJ` (the files spice2x
+   itself reads);
+3. **the cabinet rom the game itself reads** (`/c_drv/000rom.txt`), asked for through
+   `avs2-core.dll` (in TDJ mode spice2x injects that rom in memory, there is no file on disk, and
+   the core's export names are obfuscated and change between builds, so every naming scheme spice2x
+   knows about is tried). This runs on the game's own thread (the `EnumDisplaySettings`,
+   `CreateDevice` and first draw callbacks) and re-runs the "desktop already matches, so hands off"
+   decision once the answer is in.
+
+The `cabinet:` line of the report shows what all three signals said, which makes any future
+mismatch easy to diagnose.
+
 
 Hotkeys (hold Ctrl+Shift while the game window is focused): `F9` switch 120/60, `F10` toggle the
 refresh spoof, `F11` dump a status line.

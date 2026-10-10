@@ -81,7 +81,7 @@
 #define MODULE_TAG  "iidxfps"
 #define INI_NAME    "iidxfps.ini"
 #define REPORT_NAME "iidxfps_report.txt"
-#define IIDXFPS_VERSION "1.0.0"
+#define IIDXFPS_VERSION "1.0.1"
 
 #define DEFAULT_FPS_TDJ 120
 #define DEFAULT_FPS_LDJ 60
@@ -346,24 +346,229 @@ static int file_equals(const char *path, const char *expect) {
     return _stricmp(buf, expect) == 0;
 }
 
+/* Every TDJ related spice2x option contains "iidxtdj" (-iidxtdj, -iidxtdjw,
+   -iidxtdjsubsize, -iidxtdjcamhook...), and none of them exists for the LDJ
+   cabinet, so the launcher command line is an exact *and instant* answer.  It is
+   read before the game enumerates a single display mode, which keeps the whole
+   mode table and the refresh spoof consistent from the first frame on. */
+static int command_line_says_tdj(void) {
+    static const char needle[] = "iidxtdj";
+    const char *p = GetCommandLineA();
+    size_t i;
+
+    if (!p) {
+        return 0;
+    }
+    for (; *p; p++) {
+        if ((char)(*p | 0x20) != needle[0]) {
+            continue;
+        }
+        for (i = 1; needle[i]; i++) {
+            char c = p[i];
+            if (!c || (char)(c | 0x20) != needle[i]) {
+                break;
+            }
+        }
+        if (!needle[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* same detection spice2x itself uses for the TDJ cabinet */
 static int detect_tdj(void) {
+    if (command_line_says_tdj()) {
+        return 1;
+    }
     if (file_equals("C:\\000rom.txt", "TDJ-JA")) {
         return 1;
     }
     if (file_equals("D:\\001rom.txt", "TDJ")) {
         return 1;
     }
-    if (g_spice.get_avs_info) {
-        SPICE_SDK_AVS_INFO info;
-        memset(&info, 0, sizeof(info));
-        if (g_spice.get_avs_info(&info) == SPICE_SDK_STATUS_SUCCESS) {
-            if (_stricmp(info.model, "TDJ") == 0) {
-                return 1;
-            }
+    /* NOTE: the ea3 model string is *not* used here.  In TDJ mode spice2x only
+       injects the cabinet rom in memory, the game's prop/ea3-config.xml keeps
+       saying "LDJ", so checking the model would never match a real TDJ setup
+       (and would misfire on a mis-configured install).  The cabinet rom is
+       checked at runtime instead, see avs_read_cabinet_rom(). */
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* TDJ detection through the AVS filesystem                           */
+/* ------------------------------------------------------------------ */
+/*
+ * spice2x switches a cabinet to TDJ by injecting the cabinet rom in memory:
+ *
+ *     hooks::avs::set_rom("/c_drv/000rom.txt", "TDJ-JA");
+ *
+ * so the game's own read of that path is answered by spice2x's avs_fs_open
+ * hook and no file exists on disk.  The only way for a module to see the same
+ * truth is to ask the very same AVS filesystem, i.e. call avs2-core.dll.
+ *
+ * avs2-core.dll exports under obfuscated names that change between builds, so
+ * every name set spice2x knows about is tried (taken from spice2x avs/core.cpp)
+ * which keeps this independent of the game and core version.
+ */
+typedef unsigned int avs_file_t;
+
+typedef struct {
+    const char *open;
+    const char *read;
+    const char *close;
+} avs_name_set_t;
+
+static const avs_name_set_t AVS_NAME_SETS[] = {
+    { "avs_fs_open",    "avs_fs_read",    "avs_fs_close"    },
+    { "XCgsqzn000004e", "XCgsqzn0000051", "XCgsqzn0000055" },
+    { "XCnbrep700004e", "XCnbrep7000051", "XCnbrep7000055" },
+    { "XCnbrep7000039", "XCnbrep700003c", "XCnbrep7000040" },
+    { "XCd229cc000090", "XCd229cc00010d", "XCd229cc00011f" },
+    { "XC058ba50000b6", "XC058ba5000139", "XC058ba500011b" },
+    { "XC0bbe970000b3", "XC0bbe97000134", "XC0bbe97000119" },
+};
+
+typedef unsigned int (*avs_fs_open_t)(const char *name, unsigned short mode, int flags);
+typedef unsigned int (*avs_fs_read_t)(avs_file_t file, unsigned char *data, unsigned int size);
+typedef void         (*avs_fs_close_t)(avs_file_t file);
+
+static avs_fs_open_t  g_avs_open;
+static avs_fs_read_t  g_avs_read;
+static avs_fs_close_t g_avs_close;
+static int            g_avs_state;         /* 0 unknown, 1 ok, -1 unavailable */
+
+static int avs_resolve(void) {
+    HMODULE core;
+    unsigned i;
+
+    if (g_avs_state != 0) {
+        return g_avs_state > 0;
+    }
+    core = GetModuleHandleA("avs2-core.dll");
+    if (!core) {
+        return 0;                          /* not loaded yet, try again later */
+    }
+    for (i = 0; i < sizeof(AVS_NAME_SETS) / sizeof(AVS_NAME_SETS[0]); i++) {
+        const avs_name_set_t *s = &AVS_NAME_SETS[i];
+        avs_fs_open_t  o = (avs_fs_open_t)(void *)GetProcAddress(core, s->open);
+        avs_fs_read_t  r = (avs_fs_read_t)(void *)GetProcAddress(core, s->read);
+        avs_fs_close_t c = (avs_fs_close_t)(void *)GetProcAddress(core, s->close);
+        if (o && r && c) {
+            g_avs_open = o;
+            g_avs_read = r;
+            g_avs_close = c;
+            g_avs_state = 1;
+            LOG_INFO("avs2-core.dll filesystem functions resolved via '%s'", s->open);
+            return 1;
         }
     }
+    g_avs_state = -1;
+    LOG_INFO("avs2-core.dll is loaded but its filesystem exports could not be resolved; "
+             "TDJ auto detection falls back to the rom files");
     return 0;
+}
+
+/* reads the cabinet rom the game itself reads; returns the length, 0 on failure.
+ *
+ * The descriptor is validated before anything else: a failed avs_fs_open does
+ * *not* return 0, it returns an HRESULT style error (0x80070002 for a missing
+ * file), and passing such a value to avs_fs_read/avs_fs_close corrupts the
+ * game's filesystem state and crashes the process.  The read length is clamped
+ * as well, because an error return from avs_fs_read would otherwise be treated
+ * as a huge length. */
+static int avs_desc_valid(avs_file_t f) {
+    return f != 0 && f != 0xFFFFFFFFu && (f & 0x80000000u) == 0;
+}
+
+static int avs_read_cabinet_rom(char *buf, size_t bufsz) {
+    avs_file_t f;
+    size_t n;
+
+    if (bufsz < 2 || !avs_resolve()) {
+        return 0;
+    }
+    f = g_avs_open("/c_drv/000rom.txt", 1, 0);       /* mode 1 = read */
+    if (!avs_desc_valid(f)) {
+        return 0;
+    }
+    memset(buf, 0, bufsz);
+    n = g_avs_read(f, (unsigned char *)buf, (unsigned int)(bufsz - 1));
+    g_avs_close(f);
+    if (n >= bufsz) {
+        n = bufsz - 1;                            /* never trust the length */
+    }
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' ||
+                     buf[n - 1] == ' '  || buf[n - 1] == '\t')) {
+        buf[--n] = '\0';
+    }
+    return (int)n;
+}
+
+/* ------------------------------------------------------------------ */
+/* runtime target rate change                                         */
+/* ------------------------------------------------------------------ */
+
+static int g_desktop_refresh;   /* defined further down */
+static void decide_pacing(void);
+
+static void set_target_fps(int fps, const char *why) {
+    int old = (int)g_target_fps;
+
+    if (fps <= 0 || fps == old) {
+        return;
+    }
+    g_target_fps = fps;
+    g_period_ticks = (double)g_qpf.QuadPart / (double)fps;
+    g_pacer_started = 0;                   /* re-arm the schedule */
+    LOG_INFO("target frame rate %d -> %d fps (%s)", old, fps, why);
+}
+
+/* Called once the game is up and running (from the game's own thread), because
+   TDJ mode is only visible through the cabinet rom the game reads at boot.
+   Returns 1 when the cabinet rom was read (contents in buf). */
+static int rom_probe_attempts;
+static char g_rom_content[64];
+static volatile LONG g_rom_probe_done;
+
+static void tdj_recheck_from_rom(void) {
+    char buf[64];
+
+    if (InterlockedCompareExchange(&g_rom_probe_done, 1, 0) != 0) {
+        return;
+    }
+    if (avs_read_cabinet_rom(buf, sizeof(buf))) {
+        memset(g_rom_content, 0, sizeof(g_rom_content));
+        strncpy(g_rom_content, buf, sizeof(g_rom_content) - 1);
+        LOG_INFO("cabinet rom (/c_drv/000rom.txt) = \"%s\"", buf);
+        if (g_cfg.target_fps != 0) {
+            return;                        /* the user pinned the rate in the ini */
+        }
+        if (_strnicmp(buf, "TDJ", 3) == 0) {
+            if (g_target_fps != DEFAULT_FPS_TDJ) {
+                set_target_fps(DEFAULT_FPS_TDJ, "the game's cabinet rom says TDJ");
+                if (g_paced_device && !g_pacing_enabled) {
+                    /* the device already exists, so vsync can no longer be turned
+                       off and the loop stays capped by the display refresh rate */
+                    LOG_WARN("this is a TDJ (120 fps) cabinet but the module is hands-off "
+                             "because the desktop runs at %dHz; set FPS=120 in " INI_NAME
+                             " and restart the game, otherwise the game runs at half speed "
+                             "and the monitor check will fail", g_desktop_refresh);
+                }
+            }
+        } else if (_strnicmp(buf, "LDJ", 3) == 0 && g_target_fps != DEFAULT_FPS_LDJ) {
+            set_target_fps(DEFAULT_FPS_LDJ, "the game's cabinet rom says LDJ");
+        }
+        return;
+    }
+    /* the rom could not be read: retry a few times, then accept "not a TDJ
+       cabinet" (on an LDJ cabinet the path simply does not exist) */
+    if (++rom_probe_attempts < 10) {
+        InterlockedExchange(&g_rom_probe_done, 0);
+        return;
+    }
+    LOG_INFO("cabinet rom (/c_drv/000rom.txt) is not readable "
+             "(normal on an LDJ cabinet)");
 }
 
 static void resolve_target_fps(void) {
@@ -374,12 +579,9 @@ static void resolve_target_fps(void) {
     } else {
         int tdj = detect_tdj();
         fps = tdj ? DEFAULT_FPS_TDJ : DEFAULT_FPS_LDJ;
-        LOG_INFO("target frame rate: %d fps (auto: cabinet=%s)",
-                 fps, tdj ? "TDJ 120Hz" : "LDJ 60Hz");
-        if (!tdj) {
-            LOG_INFO("if this cabinet really runs 120Hz timing "
-                     "(LDJ + custom timing/adapter FPS patch), set FPS=120 in " INI_NAME);
-        }
+        LOG_INFO("target frame rate: %d fps (auto: %s)", fps,
+                 tdj ? "TDJ cabinet (120 fps timing)"
+                     : "LDJ cabinet, will be confirmed against the game's cabinet rom");
     }
     g_target_fps = fps;
     g_period_ticks = (double)g_qpf.QuadPart / (double)fps;
@@ -648,6 +850,12 @@ static HRESULT STDMETHODCALLTYPE createdevice_hook(
 
     log_present_params("CreateDevice", p);
 
+    /* Last chance to change the target rate and the vsync decision: the cabinet
+       rom has been read by the game long before the device is created, and the
+       boot time monitor check only runs afterwards. */
+    tdj_recheck_from_rom();
+    decide_pacing();
+
     if (p && g_cfg.force_immediate && g_pacing_enabled && !g_measure_only &&
         p->PresentationInterval != PRESENT_INTERVAL_IMMEDIATE) {
         saved_interval = p->PresentationInterval;
@@ -687,6 +895,10 @@ static HRESULT STDMETHODCALLTYPE createdeviceex_hook(
     HRESULT hr;
 
     log_present_params("CreateDeviceEx", p);
+
+    /* see createdevice_hook: settle the cabinet type before deciding about vsync */
+    tdj_recheck_from_rom();
+    decide_pacing();
 
     if (p && g_cfg.force_immediate && g_pacing_enabled && !g_measure_only &&
         p->PresentationInterval != PRESENT_INTERVAL_IMMEDIATE) {
@@ -960,6 +1172,14 @@ static void __cdecl d3d9_callback(
         }
     }
     InterlockedIncrement64(&g_ev_draw);
+    /* The cabinet type is only visible in the rom the game reads while booting.
+       It is normally settled in the CreateDevice hook (earlier and before the
+       monitor check), this is just a safety net for setups where we never see a
+       device creation.  Running it from the game's own thread means we never
+       touch its filesystem concurrently. */
+    if (InterlockedCompareExchange64(&g_ev_draw, 0, 0) == 1) {
+        tdj_recheck_from_rom();
+    }
     if (g_pace_point == PACE_DRAW) {
         pace_frame();
     }
@@ -1043,7 +1263,6 @@ static void handle_hotkeys(void) {
 
     if (k9 && !prev9) {
         int next;
-        int old = g_target_fps;
         if (g_target_fps == 120) {
             next = 60;
         } else if (g_target_fps == 60) {
@@ -1051,10 +1270,7 @@ static void handle_hotkeys(void) {
         } else {
             next = (g_target_fps == 30) ? 120 : 30;
         }
-        g_target_fps = next;
-        g_period_ticks = (double)g_qpf.QuadPart / (double)next;
-        g_pacer_started = 0;
-        LOG_INFO("hotkey: target frame rate %d -> %d fps", old, next);
+        set_target_fps(next, "hotkey Ctrl+Shift+F9");
     }
     if (k10 && !prev10) {
         LONG v = InterlockedCompareExchange(&g_spoof_on, 0, 0) ? 0 : 1;
@@ -1125,6 +1341,13 @@ static void write_report(double fps_draw, double fps_swapchain, double fps_prese
                   g_spice.register_d3d9 ? "yes" : "no");
     report_append(f, "desktop  : %dHz   game is told %ldHz",
                   g_desktop_refresh, (long)(g_spoof_on ? g_target_fps : g_desktop_refresh));
+    if (g_cfg.target_fps == 0) {
+        report_append(f, "cabinet  : auto -> rom files(TDJ)=%s  game rom(/c_drv/000rom.txt)=\"%s\"",
+                      detect_tdj() ? "yes" : "no",
+                      g_rom_content[0] ? g_rom_content : "(not readable)");
+    } else {
+        report_append(f, "cabinet  : fixed at %d fps in " INI_NAME, g_cfg.target_fps);
+    }
     report_append(f, "pacing   : %s   pacePoint=%s   deviceHooked=%ld",
                   g_measure_only ? "measure only"
                                  : (g_pacing_enabled ? "ENABLED (QPC schedule, vsync off)"
@@ -1280,10 +1503,10 @@ static unsigned __stdcall worker_thread(void *arg) {
     log_display_state();
     decide_pacing();
 
+    install_game_hooks();
+
     LOG_INFO("pacing: %s, target %ld fps, pacing point = %s",
              g_pacing_enabled ? "ENABLED" : "disabled", (long)g_target_fps, pace_point_name());
-
-    install_game_hooks();
 
     QueryPerformanceCounter(&last);
     {
@@ -1304,12 +1527,13 @@ static unsigned __stdcall worker_thread(void *arg) {
 
             handle_hotkeys();
 
-            /* Pick the pacing point that is really being called, sampled every 20ms.
-               The spice draw callback fires exactly once per game frame, which is
-               what we want to pace, so it wins over the swap chain (twice per
-               frame here) and over the device present (never called here).
-               Switching to a *lower* priority point only happens when the current
-               one went completely silent, which stops the selection from flapping. */
+            /* Pick the pacing point that is really being called, sampled every
+               20ms.  v1 paces before the present, so the spice draw callback
+               (exactly once per game frame) is the best point.  v2 paces after
+               the present, so the swap chain / device Present wins and the draw
+               callback is only a fallback.  Switching to a *lower* priority
+               point only happens when the current one went completely silent,
+               which stops the selection from flapping. */
             if (g_pacing_enabled && g_cfg.pace_at == PACE_AUTO) {
                 LONG64 cs = (LONG64)InterlockedCompareExchange64(&g_ev_swapchain, 0, 0);
                 LONG64 cd = (LONG64)InterlockedCompareExchange64(&g_ev_present, 0, 0);
@@ -1348,6 +1572,12 @@ static unsigned __stdcall worker_thread(void *arg) {
             dt = accum;
             accum = 0.0;
             ticks++;
+
+            /* NOTE: the cabinet rom is only ever asked for from the game's own
+               thread (the EnumDisplaySettings hook, the CreateDevice hook and the
+               first draw callback).  Calling the AVS filesystem from this thread
+               hangs on a real (non injected) filesystem access, so never do it
+               here. */
 
             swapchain = (LONG64)InterlockedCompareExchange64(&g_ev_swapchain, 0, 0);
             present = (LONG64)InterlockedCompareExchange64(&g_ev_present, 0, 0);

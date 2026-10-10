@@ -106,7 +106,50 @@ spice2x 的插件 SDK 提供 `register_d3d9`：它会在**每次游戏主循环*
 
 ---
 
-## 5. 硬件/驱动层面的补充观察
+## 5. TDJ / LDJ 是怎么判定的（踩坑记录）
+
+一开始用 SDK 的 `get_avs_info().model` 判断机台：`model == "TDJ"` 就算 TDJ。**这是错的。**
+
+`avs::game::MODEL` 来自游戏自己的 `prop/ea3-config.xml` 的 `<model>` 节点，而开 TDJ 模式时
+spice2x 并不会改这个文件（用户装的就是 LDJ 的配置，节点一直是 `LDJ`），spice2x 干的是：
+
+```cpp
+// games/iidx/iidx.cpp
+TDJ_MODE |= fileutils::text_read("C:\\000rom.txt") == "TDJ-JA";
+TDJ_MODE |= fileutils::text_read("D:\\001rom.txt") == "TDJ";
+if (TDJ_MODE) {
+    hooks::avs::set_rom("/c_drv/000rom.txt", "TDJ-JA");   // ← 注入到内存
+    hooks::avs::set_rom("/d_drv/001rom.txt", "TDJ");
+    ...
+}
+```
+
+`set_rom` 只是往 spice2x 的一个 `std::map` 里塞内容，游戏通过 AVS 文件系统读
+`/c_drv/000rom.txt` 时被 spice2x 的 `avs_fs_open` 钩子拦下来，返回一个假的 fd（1337），
+再读就是 `"TDJ-JA"`。**硬盘上根本没有这个文件**，所以看文件是看不出来的。
+
+于是正确的判定方式是：**从命令行、从 spice2x 自己读的那两个文件、以及用 `avs2-core.dll`
+调同一个 AVS 文件系统去读游戏读的那份 ROM**。后者要注意：
+
+* `avs2-core.dll` 的导出名是混淆的（`XCgsqzn000004e` 之类）且随版本变化，
+  所以要把 spice2x 源码里所有版本的命名都试一遍；
+* **失败的 `avs_fs_open` 返回的不是 0，而是 HRESULT 风格错误码（文件不存在是 `0x80070002`）**。
+  把它当句柄传给 `avs_fs_read`/`avs_fs_close` 会破坏游戏 VFS 状态并直接崩进程
+  （日志里表现为 `W:vfs: read: desc 80070002 != AVS_DTYPE_FS` 然后 `EXCEPTION_ACCESS_VIOLATION`）；
+  而且 `avs_fs_read` 出错时会返回一个很大的值，当成读取长度就会越界。两处都必须防。
+* 这个调用**必须在游戏自己的线程上做**：在 worker 线程上调用真实（非注入）文件系统的 open
+  会挂住；在启动早期（例如游戏刚开始枚举显示模式时）调用也可能阻塞。放在
+  `EnumDisplaySettings` / `CreateDevice` / 首帧绘制回调里最稳。
+
+还有两个实测结论：
+
+* 一帧在窗口化下会 Present 两个交换链（见第 1 节），**限速点必须选"一帧恰好一次"的那个**；
+* 游戏在首帧之后会阻塞 4 秒左右（自检/资源加载），期间没有任何绘制。
+  所以"等几帧再判定机台"会让判定落到自检之后——一定要在 `CreateDevice` 之前就把机台定下来。
+
+---
+
+## 6. 硬件/驱动层面的补充观察
 
 * **全屏 vs 窗口化**：实测窗口化时一帧 Present 两个交换链（`fps(swapchain) ≈ 2 × fps(draw)`），
   全屏时只有一个（`fps(swapchain) = fps(draw)`）。所以限速点不能写死。

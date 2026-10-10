@@ -59,11 +59,28 @@ IIDX 的游戏逻辑是**"每次主循环推进一帧"**，没有任何基于真
 
 | 键 | 说明 |
 |---|---|
-| `FPS=auto\|60\|120` | 目标帧率。`auto` 按 TDJ/LDJ 机台自动判断。**如果 LDJ 打了 `Force LDJ Custom Timing/Adapter FPS = 120` 这类补丁，必须写 `FPS=120`**，否则会变半速 |
+| `FPS=auto\|60\|120` | 目标帧率。`auto` 会自动判断机台（见下）。**如果 LDJ 打了 `Force LDJ Custom Timing/Adapter FPS = 120` 这类补丁，必须写 `FPS=120`**，否则会变半速 |
 | `PaceAt=auto\|draw\|swapchain\|present` | 限速点，`auto` 会自动挑实际被调用的那个（本游戏是 spice 的绘制回调，一帧一次） |
 | `ForceImmediatePresent=1` | 必须为 1，否则在高于目标帧率的显示器上压不下来 |
 | `SkipWhenRefreshMatches=1` | 刷新率本来就等于目标帧率时什么都不做（避免把正常机器弄出撕裂） |
 | `MeasureOnly=1` | 只测量、不干预，用来确认游戏原本跑多少帧 |
+
+### `FPS=auto` 是怎么判断 TDJ / LDJ 的
+
+按顺序试三个信号，任意一个成立就算 TDJ（120 帧）：
+
+1. **启动命令行**里有没有 `iidxtdj`（`-iidxtdj`、`-iidxtdjw`、`-iidxtdjsubsize` … 这些
+   TDJ 专用参数都含这个串，LDJ 没有）。这条是**立刻**可得的，所以在游戏枚举显示模式之前
+   就已经确定，整张模式表和刷新率欺骗从第一帧起就是一致的。
+2. `C:\000rom.txt` 内容为 `TDJ-JA`，或 `D:\001rom.txt` 内容为 `TDJ`（spice2x 自己也读这两个文件）。
+3. **游戏自己读的机台 ROM**（`/c_drv/000rom.txt`）——通过 `avs2-core.dll` 调同一个 AVS 文件系统
+   去读（spice2x 在 TDJ 模式下是把这份 ROM 注入到内存里的，硬盘上没有文件；`avs2-core.dll`
+   的导出名是混淆的且随版本变化，模块会把 spice2x 认识的所有命名都试一遍）。
+   这一步在游戏自己的线程上做（`EnumDisplaySettings`、`CreateDevice`、第一帧绘制回调），
+   读到之后会重新评估"桌面刷新率已经匹配就不介入"的判断。
+
+报告文件里的 `cabinet:` 行会同时列出这三个信号的实际结果，方便排查。
+
 
 游戏内快捷键（按住 Ctrl+Shift）：`F9` 切换 120/60，`F10` 开关刷新率欺骗，`F11` 输出状态。
 
