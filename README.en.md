@@ -155,9 +155,10 @@ without the module runs at the display refresh rate (120.35).
 
 ## Known limitations
 
-* **The full Monitor Check flow has never been walked through** (it needs a real server, a coin
-  and the TEST menu). What is verified is that the game is told the target refresh rate and that
-  the real frame rate is locked to the same value. If it still fails, please send the report file.
+* **The Monitor Check has been verified on a real TDJ cabinet** (2026-10-10, IIDX 33 + spice2x,
+  240Hz desktop, fullscreen: `target=120`, `draw≈120`, the self test passes and the game runs
+  normally). LDJ cabinets work as well (`target=60`). If your cabinet still reports an error, please
+  send the report file.
 * To hit a rate the display cannot be driven at, the module disables vsync, so **tearing is
   possible**. That is the price of an exact frame rate.
 * Do not combine it with RTSS or driver level frame limiters (the slowest one wins).

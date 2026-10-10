@@ -9,6 +9,11 @@ Monitor Check 因为帧率不稳而报错"的问题。
 它**不修改 bm2dx.dll**，也不改任何游戏文件，只是作为一个 spice2x 模块被加载进来，
 用 Windows 高精度计时器把游戏主循环精确按住到 120 帧（TDJ）或 60 帧（LDJ）。
 
+机台类型是自动判定的（启动参数里的 -iidxtdj、spicecfg 里的 IIDX TDJ Mode 勾选、
+C:\000rom.txt / D:\001rom.txt、以及游戏自己读的机台 ROM，任一成立即为 TDJ），
+所以一般不需要改配置。只有"LDJ 机台 + 打了强制 120Hz 计时补丁"这种情况下才需要
+手动在 ini 里写 FPS=120。
+
 
 安装
 ----

@@ -128,8 +128,16 @@ if (TDJ_MODE) {
 `/c_drv/000rom.txt` 时被 spice2x 的 `avs_fs_open` 钩子拦下来，返回一个假的 fd（1337），
 再读就是 `"TDJ-JA"`。**硬盘上根本没有这个文件**，所以看文件是看不出来的。
 
-于是正确的判定方式是：**从命令行、从 spice2x 自己读的那两个文件、以及用 `avs2-core.dll`
-调同一个 AVS 文件系统去读游戏读的那份 ROM**。后者要注意：
+于是正确的判定方式是四个信号，按"越早越好"排序：
+
+1. **启动命令行**里的 TDJ 模式开关（`-iidxtdj` / `-iidxtdjw`）。注意别用子串匹配：
+   `-iidxtdjcamhook`、`-iidxtdjsubsize` 这些名字里也含 `iidxtdj`，但**关掉 TDJ 之后它们还留在配置里**，
+   用子串匹配会把普通 LDJ 机台误判成 TDJ 并锁到 120 帧（游戏两倍速）。
+2. **spicecfg 的选项文件** `%APPDATA%\spicetools.xml`（界面里勾选就存在这）。
+   spice2x 用 `value_bool() { return !value.empty(); }` 判断布尔项，而 spicecfg 写入的"启用"值是
+   字面量 `/ENABLED`，所以判定就是"该 option 存在且 value 非空"。
+3. `C:\000rom.txt` = `TDJ-JA` 或 `D:\001rom.txt` = `TDJ`（spice2x 自己也读这两个文件）。
+4. **用 `avs2-core.dll` 调同一个 AVS 文件系统去读游戏读的那份 ROM**（兜底）。这里有几个坑：
 
 * `avs2-core.dll` 的导出名是混淆的（`XCgsqzn000004e` 之类）且随版本变化，
   所以要把 spice2x 源码里所有版本的命名都试一遍；
@@ -137,9 +145,8 @@ if (TDJ_MODE) {
   把它当句柄传给 `avs_fs_read`/`avs_fs_close` 会破坏游戏 VFS 状态并直接崩进程
   （日志里表现为 `W:vfs: read: desc 80070002 != AVS_DTYPE_FS` 然后 `EXCEPTION_ACCESS_VIOLATION`）；
   而且 `avs_fs_read` 出错时会返回一个很大的值，当成读取长度就会越界。两处都必须防。
-* 这个调用**必须在游戏自己的线程上做**：在 worker 线程上调用真实（非注入）文件系统的 open
-  会挂住；在启动早期（例如游戏刚开始枚举显示模式时）调用也可能阻塞。放在
-  `EnumDisplaySettings` / `CreateDevice` / 首帧绘制回调里最稳。
+* 这个调用要放在**游戏自己的线程**上做（`EnumDisplaySettings` / `CreateDevice` / 首帧绘制回调）：
+  这样绝不会和游戏自己的文件系统操作并发；在启动早期（例如游戏刚开始枚举显示模式时）调用也可能阻塞。
 
 还有两个实测结论：
 
@@ -157,3 +164,13 @@ if (TDJ_MODE) {
   这不是模块的问题，游戏在前台时不受影响。
 * **显示器模式表**：测试机的显示器支持 120/144/165/240Hz；游戏会枚举全部模式。
   这也解释了为什么"高刷屏反而更容易触发这个 bug"。
+
+---
+
+## 7. 实测结论（2026-10-10 更新）
+
+* LDJ 机台（240Hz 桌面、全屏）：`target=60`、`draw=59.6~60.9`、帧间隔 15~18ms；
+* TDJ 机台（同上，`-iidxtdj`）：`target=120`、`draw=119.4~120.9`，**开机自检 Monitor Check 通过**，
+  游戏运行正常；
+* 122 个显示模式枚举在 TDJ 下全部报 120Hz（判定在枚举之前完成，模式表一致）；
+* 两条路径（命令行 `-iidxtdj` / spicecfg 勾选）都验证过；`FPS=auto` 不再需要手动写 `FPS=120`。
