@@ -1,0 +1,10 @@
+# Keep the repository contents LF regardless of the local git configuration,
+# but check Windows scripts out with CRLF so cmd.exe / PowerShell are happy.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# The SDK header comes from spice2x and is kept verbatim.
+src/spicesdk.h -text

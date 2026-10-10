@@ -1,0 +1,66 @@
+iidxfps —— 玩家安装与反馈说明
+========================================================================
+
+这是什么
+--------
+解决"IIDX 用帧计时、显示器刷新率一高游戏就变速（变快/变慢）、
+Monitor Check 因为帧率不稳而报错"的问题。
+
+它**不修改 bm2dx.dll**，也不改任何游戏文件，只是作为一个 spice2x 模块被加载进来，
+用 Windows 高精度计时器把游戏主循环精确按住到 120 帧（TDJ）或 60 帧（LDJ）。
+
+
+安装
+----
+1) 把 iidxfps.dll 和 iidxfps.ini 复制到游戏的 contents 目录
+   （和 spice64.exe、bm2dx.dll、2dx-gsm.dll 同一层）。
+
+2) 在你平时用的启动 bat 里，给 spice64.exe 的参数加上：
+
+       -k iidxfps.dll
+
+   例如原来是：
+
+       spice64.exe -url http://xxx -p <你的PCBID> -k 2dx-gsm.dll -k IIDXScore.dll
+
+   改成：
+
+       spice64.exe -url http://xxx -p <你的PCBID> -k iidxfps.dll -k 2dx-gsm.dll -k IIDXScore.dll
+
+   （-k 的顺序无所谓，放前面后面都可以。）
+
+3) 正常启动游戏即可，不需要任何其它设置。
+
+
+怎么确认它在工作
+----------------
+游戏目录里会生成一个 iidxfps_report.txt，里面有：
+
+  desktop  : 120Hz   game is told 60Hz        <- 桌面刷新率 / 告诉游戏的刷新率
+  pacing   : ENABLED ...  pacePoint=draw      <- 是否在限速、限速点
+  frames/s : draw=60.40 swapchain=119.82 ...  <- draw 就是游戏逻辑帧率
+
+`draw` 应该稳定在 120 或 60（±1%）就说明生效了。
+
+
+需要反馈问题时
+--------------
+把游戏目录里的 **iidxfps_report.txt** 直接发出来即可，它已经包含配置、机台判定、
+桌面刷新率、限速点、实测帧率和最近的日志，不需要再翻 log.txt。
+
+
+常见情况
+--------
+* 桌面刷新率本来就等于目标帧率（例如 60Hz 显示器 + 60 帧机台）：
+  模块会主动"什么都不做"（保持垂直同步、不限速），这样画面最干净。
+  报告里会写 `pacing : hands off (refresh matches)`。
+
+* 出现半速：报告里会有 `WARNING: pacing ran more than once per frame`，
+  把 iidxfps.ini 里的 HookPresentEx 改成 0 再试。
+
+* 如果你在用 RTSS / 显卡驱动的"帧率限制"功能：请不要和本模块同时限速，
+  否则会互相打架（限速值取更慢的那个）。建议关掉它们，或者设成同样的值。
+
+* 本模块为了把帧率压到 120/60，会关掉垂直同步，**可能出现画面撕裂**。
+  这是把帧率锁准的必要代价；如果在意撕裂又不需要修速度，
+  把 iidxfps.ini 里的 Enabled 改成 0 即可。

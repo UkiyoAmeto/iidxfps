@@ -1,0 +1,26 @@
+iidxfps 1.0.0 - beatmania IIDX frame timing report
+generated: 2026-01-02 03:04:05
+config   : Enabled=1 FPS=auto target=60 PaceAt=draw ForceImmediatePresent=1
+           SpoofDisplayRefresh=1 SpoofAllModes=1 HighPrecisionTime=1
+           MeasureOnly=0 SkipWhenRefreshMatches=1 ForcePacing=0
+           HookPresent=1 HookPresentEx=1 register_d3d9=yes
+desktop  : 120Hz   game is told 60Hz
+pacing   : ENABLED (QPC schedule, vsync off)   pacePoint=draw   deviceHooked=1
+frames/s : draw=60.40 swapchain=119.82 present=0.00 paced=60 late=0 skipped=0
+frame gap: 14.574 .. 18.372 ms
+--- last messages (oldest first), ring next=160 size=24 ---
+[16] 03:03:59 CreateDeviceEx: PresentationInterval 0x00000000 -> IMMEDIATE (vsync off)
+[17] 03:03:59 CreateDeviceEx ok (0x00000000) device=0000000003656B80
+[18] 03:03:59 device 0000000003656B80: implicit swap chain 000000002780E320 Present hooked (real 0000000000771D30)
+[19] 03:03:59 device 0000000003656B80: Present hooked (real 000000000076AA70), PresentEx hooked
+[20] 03:03:59 pacing point selected: present
+[21] 03:03:59 first swap chain instance: 000000002780E3E0
+[22] 03:03:59 EnumDisplaySettingsA mode=4294967295 1920x1080 32bpp 120Hz -> 60Hz
+[23] 03:03:59 pacing point selected: draw
+[00] 03:04:00 fps(swapchain)=1.00 fps(present)=1.00 fps(draw)=1.00 pacePoint=draw paced=0 late=0 skip=0 gap=0.000..0.000 ms target=60
+[01] 03:04:04 fps(swapchain)=57.69 fps(present)=0.00 fps(draw)=28.85 pacePoint=draw paced=29 late=0 skip=0 gap=8.527..4255.630 ms target=60
+[02] 03:04:05 fps(swapchain)=120.49 fps(present)=0.00 fps(draw)=60.74 pacePoint=draw paced=60 late=0 skip=0 gap=15.278..17.585 ms target=60
+[03] 03:04:06 fps(swapchain)=119.45 fps(present)=0.00 fps(draw)=59.73 pacePoint=draw paced=60 late=0 skip=0 gap=15.495..17.905 ms target=60
+[04] 03:04:07 fps(swapchain)=120.75 fps(present)=0.00 fps(draw)=59.88 pacePoint=draw paced=61 late=0 skip=0 gap=15.310..18.253 ms target=60
+[05] 03:04:08 fps(swapchain)=119.35 fps(present)=0.00 fps(draw)=59.68 pacePoint=draw paced=60 late=0 skip=0 gap=8.896..27.806 ms target=60
+[06] 03:04:09 fps(swapchain)=120.60 fps(present)=0.00 fps(draw)=60.80 pacePoint=draw paced=60 late=0 skip=0 gap=14.674..18.167 ms target=60

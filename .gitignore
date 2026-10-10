@@ -1,0 +1,28 @@
+# build output
+build/
+test/out/
+
+# compiled objects / debug info
+*.pdb
+*.lib
+*.obj
+*.exp
+*.ilk
+
+# packaging and the files players drop next to the game (keep them out of git,
+# attach them to a GitHub release instead)
+/dist/
+/iidxfps.dll
+/iidxfps.ini
+/iidxfps_report.txt
+
+# local build toolchain (zig etc.)
+tools/
+
+# editor / OS noise
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*~

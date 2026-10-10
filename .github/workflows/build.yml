@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # zig is used instead of MSVC: no installation, no license hassle, and
+      # exactly the toolchain the release binaries are built with.
+      - name: Install zig
+        shell: pwsh
+        run: |
+          $version = '0.14.1'
+          $name = "zig-x86_64-windows-$version"
+          Invoke-WebRequest "https://ziglang.org/download/$version/$name.zip" -OutFile zig.zip
+          Expand-Archive zig.zip -DestinationPath .
+          "$PWD\$name" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build iidxfps.dll
+        shell: cmd
+        run: build.bat
+
+      - name: Build the test harness
+        shell: cmd
+        run: test\build_test.bat
+
+      # build smoke test only: CI runners have no real GPU, so on a runner the
+      # fake game may not even be able to create a D3D9 device.  The point is
+      # that everything loads and runs without crashing.
+      - name: Smoke test (load the module, run the harness)
+        shell: cmd
+        run: |
+          copy docs\iidxfps.ini test\out\iidxfps.ini
+          cd test\out
+          host.exe 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iidxfps-dll
+          path: build/iidxfps.dll

@@ -1,0 +1,1572 @@
+/*
+ * iidxfps - beatmania IIDX high precision frame timer (spice2x module)
+ * Copyright (C) 2026  iidxfps contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * ---------------------------------------------------------------------------
+ * The module is loaded by spice2x (https://github.com/spice2x/spice2x.github.io)
+ * and uses its plugin SDK header (src/spicesdk.h, GPL-3.0).
+ * It does NOT patch or modify bm2dx.dll in any way.
+ * ---------------------------------------------------------------------------
+ */
+/*
+ * iidxfps - beatmania IIDX high precision frame timer / monitor check helper
+ *
+ * Loaded as a spice2x module:   spice64.exe ... -k iidxfps.dll
+ *
+ * What it does (nothing on disk is modified, bm2dx.dll itself is never patched):
+ *
+ *   1) QPC frame pacer
+ *      The game advances its logic once per presented frame, so the game speed
+ *      follows the display refresh rate (a 144Hz display makes everything run
+ *      20% fast).  We intercept IDirect3D9::CreateDevice(Ex) through the game's
+ *      own import table, force the swap chain to D3DPRESENT_INTERVAL_IMMEDIATE
+ *      (no vsync) and then gate IDirect3DDevice9::Present on a
+ *      QueryPerformanceCounter schedule locked to the cabinet's native rate
+ *      (120Hz for TDJ, 60Hz for LDJ).  Result: exactly N logic ticks per second
+ *      no matter what the monitor refresh rate is.
+ *
+ *   2) Adapter refresh spoof
+ *      bm2dx.dll imports EnumDisplaySettingsA and reads the adapter refresh
+ *      rate out of the returned DEVMODE.  We hook that import so the game is
+ *      always told the native rate (120/60), keeping its internal timing and
+ *      its monitor check consistent with what we actually deliver.
+ *
+ *   3) Diagnostics
+ *      Measured frame rate, late frames, skipped phases and the display mode the
+ *      game asked for are written to the spice log, so the behaviour can be
+ *      checked without a debugger.
+ *
+ * All hooks are import-table or per-object vtable hooks, i.e. they only depend
+ * on *names* (Direct3DCreate9Ex, IDirect3D9::CreateDevice, Present,
+ * EnumDisplaySettingsA), never on addresses inside a specific bm2dx.dll build.
+ */
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <process.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include "spicesdk.h"
+
+/* ------------------------------------------------------------------ */
+/* constants                                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * iidxfps - lock the game loop to the cabinet's native frame rate with
+ * QueryPerformanceCounter, with vsync disabled so that the rate is exact on
+ * any display.  The loop is held back *before* the real present, which is the
+ * cheapest and most latency friendly place for a self paced frame limiter.
+ */
+#define MODULE_TAG  "iidxfps"
+#define INI_NAME    "iidxfps.ini"
+#define REPORT_NAME "iidxfps_report.txt"
+#define IIDXFPS_VERSION "1.0.0"
+
+#define DEFAULT_FPS_TDJ 120
+#define DEFAULT_FPS_LDJ 60
+
+#define PRESENT_INTERVAL_IMMEDIATE 0x80000000u
+
+#define VTBL_IDIRECT3D9_CREATEDEVICE     16
+#define VTBL_IDIRECT3D9_CREATEDEVICEEX   20
+#define VTBL_DEVICE_GETSWAPCHAIN         14
+#define VTBL_DEVICE_PRESENT              17
+#define VTBL_DEVICE_PRESENTEX            121
+#define VTBL_SWAPCHAIN_PRESENT           3
+#define VTBL_RELEASE                     2
+
+/* where the loop is actually held back; "auto" picks the one that is really
+   being called, preferring the spice draw callback (once per game frame) */
+#define PACE_AUTO       0
+#define PACE_SWAPCHAIN  1
+#define PACE_DEVICE     2
+#define PACE_DRAW       3
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+/* ------------------------------------------------------------------ */
+/* D3DPRESENT_PARAMETERS (hand rolled, no d3d9 headers needed)        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    UINT  BackBufferWidth;
+    UINT  BackBufferHeight;
+    UINT  BackBufferFormat;
+    UINT  BackBufferCount;
+    UINT  MultiSampleType;
+    DWORD MultiSampleQuality;
+    UINT  SwapEffect;
+    HWND  hDeviceWindow;
+    BOOL  Windowed;
+    BOOL  EnableAutoDepthStencil;
+    UINT  AutoDepthStencilFormat;
+    DWORD Flags;
+    UINT  FullScreen_RefreshRateInHz;
+    UINT  PresentationInterval;
+} d3dpp_safe;
+
+typedef char d3dpp_size_assert[(sizeof(d3dpp_safe) == 64) ? 1 : -1];
+typedef char d3dpp_interval_assert[(offsetof(d3dpp_safe, PresentationInterval) == 60) ? 1 : -1];
+
+/* ------------------------------------------------------------------ */
+/* types                                                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int enabled;
+    int target_fps;          /* 0 = auto */
+    int pace_at;             /* 0 = present, 1 = draw */
+    int force_immediate;
+    int spoof_refresh;
+    int spoof_all_modes;
+    int log_fps;
+    int measure_only;
+    int hook_present;
+    int hook_presentex;
+    int high_precision_time;
+    int skip_when_match;
+    int force_pacing;
+} config_t;
+
+typedef HRESULT (STDMETHODCALLTYPE *create_device_t)(
+    void *, UINT, UINT, HWND, DWORD, void *, void **);
+typedef HRESULT (STDMETHODCALLTYPE *create_device_ex_t)(
+    void *, UINT, UINT, HWND, DWORD, void *, void *, void **);
+typedef HRESULT (STDMETHODCALLTYPE *present_t)(
+    void *, const RECT *, const RECT *, HWND, const RGNDATA *);
+typedef HRESULT (STDMETHODCALLTYPE *present_ex_t)(
+    void *, const RECT *, const RECT *, HWND, const RGNDATA *, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *swapchain_present_t)(
+    void *, const RECT *, const RECT *, HWND, const RGNDATA *, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *get_swapchain_t)(void *, UINT, void **);
+typedef ULONG (STDMETHODCALLTYPE *release_t)(void *);
+typedef HRESULT (WINAPI *d3dcreate9ex_t)(UINT, void **);
+typedef void * (WINAPI *d3dcreate9_t)(UINT);
+typedef BOOL (WINAPI *eds_a_t)(LPCSTR, DWORD, DEVMODEA *);
+typedef BOOL (WINAPI *eds_w_t)(LPCWSTR, DWORD, DEVMODEW *);
+typedef BOOL (WINAPI *eds_exa_t)(LPCSTR, DWORD, DEVMODEA *, DWORD);
+typedef BOOL (WINAPI *eds_exw_t)(LPCWSTR, DWORD, DEVMODEW *, DWORD);
+
+/* ------------------------------------------------------------------ */
+/* state                                                              */
+/* ------------------------------------------------------------------ */
+
+static config_t         g_cfg;
+static SPICE_SDK_V0     g_spice;
+static CRITICAL_SECTION g_log_lock;
+static int              g_log_lock_ready;
+
+static HMODULE          g_game_module;
+static volatile LONG    g_target_fps;
+static volatile LONG    g_pacing_enabled;
+static volatile LONG    g_measure_only;
+static volatile LONG    g_device_hooked;
+static volatile LONG    g_pace_point;      /* one of PACE_* */
+static volatile LONG    g_spoof_on;
+static void            *g_paced_device;
+static volatile LONG    g_draw_seen;
+static volatile LONG    g_fallback_logged;
+static volatile LONG    g_halfspeed_logged;
+
+static LARGE_INTEGER    g_qpf;
+static LARGE_INTEGER    g_qpc_epoch;
+static double           g_period_ticks;
+static LONGLONG         g_deadline;
+static LONGLONG         g_last_paced;
+static int              g_pacer_started;
+static HANDLE           g_wait_timer;
+
+static volatile LONG64  g_ev_present;
+static volatile LONG64  g_ev_swapchain;
+static volatile LONG64  g_ev_draw;
+static volatile LONG64  g_ev_paced;
+static volatile LONG64  g_ev_late;
+static volatile LONG64  g_ev_skipped;
+static volatile LONG64  g_ev_last_qpc;
+static volatile LONG64  g_ev_min_gap;
+static volatile LONG64  g_ev_max_gap;
+
+static void *g_real_createdevice;
+static void *g_real_createdeviceex;
+static void *g_real_present;
+static void *g_real_presentex;
+static void *g_real_sc_present;
+static void *g_real_d3dcreate9ex;
+static void *g_real_d3dcreate9;
+static void *g_real_edsa;
+static void *g_real_edsw;
+static void *g_real_edsexa;
+static void *g_real_edsexw;
+static void *g_real_timegettime;
+static void *g_real_gettickcount;
+static void *g_real_gettickcount64;
+
+/* forward declarations */
+static HRESULT STDMETHODCALLTYPE present_hook(
+    void *, const RECT *, const RECT *, HWND, const RGNDATA *);
+static HRESULT STDMETHODCALLTYPE presentex_hook(
+    void *, const RECT *, const RECT *, HWND, const RGNDATA *, DWORD);
+static HRESULT STDMETHODCALLTYPE createdevice_hook(
+    void *, UINT, UINT, HWND, DWORD, void *, void **);
+static HRESULT STDMETHODCALLTYPE createdeviceex_hook(
+    void *, UINT, UINT, HWND, DWORD, void *, void *, void **);
+static void do_install_device_hooks(void *device);
+static const char *pace_point_name(void);
+
+/* ------------------------------------------------------------------ */
+/* logging                                                            */
+/* ------------------------------------------------------------------ */
+
+/* ring buffer of the most recent messages, so that the report file a player
+   sends back is self contained */
+#define LOG_RING_SIZE 24
+#define LOG_RING_LEN 200
+static char g_log_ring[LOG_RING_SIZE][LOG_RING_LEN];
+static volatile LONG g_log_ring_next;
+
+static void log_ring_add(const char *text) {
+    LONG slot = InterlockedIncrement(&g_log_ring_next) - 1;
+    char *dst = g_log_ring[slot % LOG_RING_SIZE];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    _snprintf(dst, LOG_RING_LEN - 1,
+              "%02d:%02d:%02d %s", st.wHour, st.wMinute, st.wSecond, text);
+    dst[LOG_RING_LEN - 1] = '\0';
+}
+
+static void logmsg(int level, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    if (g_log_lock_ready) {
+        EnterCriticalSection(&g_log_lock);
+    }
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+    va_end(ap);
+    buf[sizeof(buf) - 1] = '\0';
+    log_ring_add(buf);
+    if (g_spice.log) {
+        g_spice.log((SPICE_SDK_LOG_LEVEL)level, MODULE_TAG, buf);
+    }
+    if (g_log_lock_ready) {
+        LeaveCriticalSection(&g_log_lock);
+    }
+}
+
+#define LOG_MISC(...)  logmsg(SPICE_SDK_LOG_LEVEL_MISC, __VA_ARGS__)
+#define LOG_INFO(...)  logmsg(SPICE_SDK_LOG_LEVEL_INFO, __VA_ARGS__)
+#define LOG_WARN(...)  logmsg(SPICE_SDK_LOG_LEVEL_WARNING, __VA_ARGS__)
+
+/* ------------------------------------------------------------------ */
+/* config                                                             */
+/* ------------------------------------------------------------------ */
+
+static void config_init(const char *ini_path) {
+    char buf[64];
+
+    g_cfg.enabled         = GetPrivateProfileIntA("General", "Enabled", 1, ini_path);
+    g_cfg.force_immediate = GetPrivateProfileIntA("General", "ForceImmediatePresent", 1, ini_path);
+    g_cfg.spoof_refresh   = GetPrivateProfileIntA("General", "SpoofDisplayRefresh", 1, ini_path);
+    g_cfg.spoof_all_modes = GetPrivateProfileIntA("General", "SpoofAllModes", 1, ini_path);
+    g_cfg.log_fps         = GetPrivateProfileIntA("General", "LogFrameRate", 1, ini_path);
+    g_cfg.measure_only    = GetPrivateProfileIntA("General", "MeasureOnly", 0, ini_path);
+    g_cfg.hook_present    = GetPrivateProfileIntA("General", "HookPresent", 1, ini_path);
+    g_cfg.hook_presentex  = GetPrivateProfileIntA("General", "HookPresentEx", 1, ini_path);
+    g_cfg.high_precision_time = GetPrivateProfileIntA("General", "HighPrecisionTime", 1, ini_path);
+    g_cfg.skip_when_match = GetPrivateProfileIntA("General", "SkipWhenRefreshMatches", 1, ini_path);
+    g_cfg.force_pacing    = GetPrivateProfileIntA("General", "ForcePacing", 0, ini_path);
+
+
+    buf[0] = '\0';
+    GetPrivateProfileStringA("General", "FPS", "auto", buf, sizeof(buf) - 1, ini_path);
+    if (_stricmp(buf, "auto") == 0 || buf[0] == '\0') {
+        g_cfg.target_fps = 0;
+    } else {
+        g_cfg.target_fps = atoi(buf);
+        if (g_cfg.target_fps < 1 || g_cfg.target_fps > 1000) {
+            g_cfg.target_fps = 0;
+        }
+    }
+
+    buf[0] = '\0';
+    GetPrivateProfileStringA("General", "PaceAt", "auto", buf, sizeof(buf) - 1, ini_path);
+    if (_stricmp(buf, "draw") == 0) {
+        g_cfg.pace_at = PACE_DRAW;
+    } else if (_stricmp(buf, "present") == 0) {
+        g_cfg.pace_at = PACE_DEVICE;
+    } else if (_stricmp(buf, "swapchain") == 0) {
+        g_cfg.pace_at = PACE_SWAPCHAIN;
+    } else {
+        g_cfg.pace_at = PACE_AUTO;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* target rate detection                                              */
+/* ------------------------------------------------------------------ */
+
+static int file_equals(const char *path, const char *expect) {
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    char buf[64];
+    DWORD read = 0;
+    if (f == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    memset(buf, 0, sizeof(buf));
+    ReadFile(f, buf, sizeof(buf) - 1, &read, NULL);
+    CloseHandle(f);
+    while (read > 0 && (buf[read - 1] == '\n' || buf[read - 1] == '\r' ||
+                        buf[read - 1] == ' ' || buf[read - 1] == '\t')) {
+        buf[--read] = '\0';
+    }
+    return _stricmp(buf, expect) == 0;
+}
+
+/* same detection spice2x itself uses for the TDJ cabinet */
+static int detect_tdj(void) {
+    if (file_equals("C:\\000rom.txt", "TDJ-JA")) {
+        return 1;
+    }
+    if (file_equals("D:\\001rom.txt", "TDJ")) {
+        return 1;
+    }
+    if (g_spice.get_avs_info) {
+        SPICE_SDK_AVS_INFO info;
+        memset(&info, 0, sizeof(info));
+        if (g_spice.get_avs_info(&info) == SPICE_SDK_STATUS_SUCCESS) {
+            if (_stricmp(info.model, "TDJ") == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void resolve_target_fps(void) {
+    int fps;
+    if (g_cfg.target_fps > 0) {
+        fps = g_cfg.target_fps;
+        LOG_INFO("target frame rate: %d fps (set in " INI_NAME ")", fps);
+    } else {
+        int tdj = detect_tdj();
+        fps = tdj ? DEFAULT_FPS_TDJ : DEFAULT_FPS_LDJ;
+        LOG_INFO("target frame rate: %d fps (auto: cabinet=%s)",
+                 fps, tdj ? "TDJ 120Hz" : "LDJ 60Hz");
+        if (!tdj) {
+            LOG_INFO("if this cabinet really runs 120Hz timing "
+                     "(LDJ + custom timing/adapter FPS patch), set FPS=120 in " INI_NAME);
+        }
+    }
+    g_target_fps = fps;
+    g_period_ticks = (double)g_qpf.QuadPart / (double)fps;
+}
+
+/* ------------------------------------------------------------------ */
+/* high precision wait                                                */
+/* ------------------------------------------------------------------ */
+
+static void pacer_global_init(void) {
+    QueryPerformanceFrequency(&g_qpf);
+    QueryPerformanceCounter(&g_qpc_epoch);
+    g_wait_timer = CreateWaitableTimerExW(
+        NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!g_wait_timer) {
+        g_wait_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+    }
+    LOG_INFO("qpc frequency %lld, wait timer %s",
+             (long long)g_qpf.QuadPart,
+             g_wait_timer ? "ok" : "unavailable (falling back to Sleep)");
+}
+
+static void wait_until(LONGLONG target) {
+    for (;;) {
+        LARGE_INTEGER now;
+        LONGLONG remain;
+        double remain_ms;
+        QueryPerformanceCounter(&now);
+        remain = target - now.QuadPart;
+        if (remain <= 0) {
+            return;
+        }
+        remain_ms = (double)remain * 1000.0 / (double)g_qpf.QuadPart;
+        if (remain_ms > 2.0) {
+            if (g_wait_timer) {
+                LARGE_INTEGER due;
+                due.QuadPart = -(LONGLONG)((remain_ms - 1.0) * 10000.0);
+                if (SetWaitableTimer(g_wait_timer, &due, 0, NULL, NULL, FALSE)) {
+                    WaitForSingleObject(g_wait_timer, (DWORD)remain_ms);
+                    continue;
+                }
+            }
+            Sleep((DWORD)(remain_ms - 1.0));
+        } else {
+            YieldProcessor();
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* the pacer                                                          */
+/* ------------------------------------------------------------------ */
+
+static void pace_frame(void) {
+    LARGE_INTEGER now;
+    LONGLONG period;
+
+    if (!g_pacing_enabled || g_measure_only) {
+        return;
+    }
+    period = (LONGLONG)(g_period_ticks + 0.5);
+    if (period <= 0) {
+        return;
+    }
+
+    if (!g_pacer_started) {
+        QueryPerformanceCounter(&now);
+        g_pacer_started = 1;
+        g_deadline = now.QuadPart + period;
+        g_last_paced = now.QuadPart;
+        InterlockedIncrement64(&g_ev_paced);
+        return;
+    }
+
+    QueryPerformanceCounter(&now);
+
+    if (now.QuadPart < g_deadline) {
+        /* this call owns the current frame: hold the loop here until the
+           scheduled presentation time.  A loop that runs thousands of times per
+           second is thereby slowed to exactly one period per call. */
+        wait_until(g_deadline);
+        QueryPerformanceCounter(&now);
+        g_deadline += period;
+        g_last_paced = now.QuadPart;
+        InterlockedIncrement64(&g_ev_paced);
+        return;
+    }
+
+    if (now.QuadPart - g_deadline > period * 2) {
+        /* badly behind (asset load, alt-tab, ...): resync instead of catching
+           up, catching up would make the game run faster than real time */
+        InterlockedIncrement64(&g_ev_late);
+        g_deadline = now.QuadPart + period;
+    } else {
+        g_deadline += period;
+    }
+
+    g_last_paced = now.QuadPart;
+    if (g_deadline <= now.QuadPart) {
+        g_deadline = now.QuadPart + period;
+    }
+    InterlockedIncrement64(&g_ev_paced);
+}
+
+/* ------------------------------------------------------------------ */
+/* IAT hooking                                                        */
+/* ------------------------------------------------------------------ */
+
+static int iat_hook(HMODULE mod, const char *dll_name, const char *func_name,
+                    void *hook_fn, void **orig_out) {
+    uint8_t *base;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_IMPORT_DESCRIPTOR *desc;
+    int hooked = 0;
+
+    if (!mod) {
+        return 0;
+    }
+    base = (uint8_t *)mod;
+    dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return 0;
+    }
+    nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return 0;
+    }
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir->VirtualAddress == 0) {
+        return 0;
+    }
+
+    desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir->VirtualAddress);
+    for (; desc->Name != 0; desc++) {
+        const char *name = (const char *)(base + desc->Name);
+        IMAGE_THUNK_DATA *oft;
+        IMAGE_THUNK_DATA *ft;
+
+        if (dll_name && dll_name[0] && _stricmp(name, dll_name) != 0) {
+            continue;
+        }
+        oft = desc->OriginalFirstThunk
+            ? (IMAGE_THUNK_DATA *)(base + desc->OriginalFirstThunk)
+            : (IMAGE_THUNK_DATA *)(base + desc->FirstThunk);
+        ft = (IMAGE_THUNK_DATA *)(base + desc->FirstThunk);
+
+        for (; oft->u1.AddressOfData != 0; oft++, ft++) {
+            IMAGE_IMPORT_BY_NAME *ibn;
+            const char *fname;
+            DWORD old_protect = 0;
+
+            if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
+                continue;
+            }
+            ibn = (IMAGE_IMPORT_BY_NAME *)(base + (uint32_t)oft->u1.AddressOfData);
+            fname = (const char *)ibn->Name;
+            if (_stricmp(fname, func_name) != 0) {
+                continue;
+            }
+            if (!VirtualProtect(&ft->u1.Function, sizeof(void *),
+                                PAGE_EXECUTE_READWRITE, &old_protect)) {
+                LOG_WARN("iat hook %s: VirtualProtect failed (%lu)", func_name, GetLastError());
+                continue;
+            }
+            if (orig_out) {
+                *orig_out = (void *)(uintptr_t)ft->u1.Function;
+            }
+            ft->u1.Function = (uintptr_t)hook_fn;
+            VirtualProtect(&ft->u1.Function, sizeof(void *), old_protect, &old_protect);
+            FlushInstructionCache(GetCurrentProcess(), &ft->u1.Function, sizeof(void *));
+            hooked++;
+        }
+    }
+    return hooked;
+}
+
+/* Patch one slot of a *shared* COM vtable (the copy that lives in the owning
+   module's read-only data).
+ *
+ * The obvious alternative - giving the object its own private copy of the
+ * vtable and swapping the object's vtable pointer - is NOT safe here: the D3D9
+ * runtime keeps metadata attached to the vtable (and caches the pointer to it
+ * inside the device), so a private copy makes it look up garbage and it jumps
+ * to NULL.  Patching the shared entry keeps everything consistent.
+ *
+ * Patching the same slot twice would capture our own hook as the "original" and
+ * recurse forever, so already patched slots are remembered.
+ */
+#define MAX_VTABLE_PATCHES 16
+static struct {
+    void **vtbl;
+    int index;
+    void *orig;
+} g_vtable_patches[MAX_VTABLE_PATCHES];
+static int g_vtable_patch_count;
+static CRITICAL_SECTION g_vtable_lock;
+
+static void *vtable_patch(void *obj, int index, void *hook_fn) {
+    void **vtbl;
+    void *orig;
+    DWORD old_protect = 0;
+    int i;
+
+    if (!obj) {
+        return NULL;
+    }
+    EnterCriticalSection(&g_vtable_lock);
+
+    vtbl = *(void ***)obj;
+    if (!vtbl) {
+        LeaveCriticalSection(&g_vtable_lock);
+        return NULL;
+    }
+    for (i = 0; i < g_vtable_patch_count; i++) {
+        if (g_vtable_patches[i].vtbl == vtbl && g_vtable_patches[i].index == index) {
+            void *already = g_vtable_patches[i].orig;
+            LeaveCriticalSection(&g_vtable_lock);
+            return already;
+        }
+    }
+
+    if (!VirtualProtect(&vtbl[index], sizeof(void *), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        LOG_WARN("vtable patch index %d: VirtualProtect failed (%lu)", index, GetLastError());
+        LeaveCriticalSection(&g_vtable_lock);
+        return NULL;
+    }
+    orig = vtbl[index];
+    vtbl[index] = hook_fn;
+    VirtualProtect(&vtbl[index], sizeof(void *), old_protect, &old_protect);
+    FlushInstructionCache(GetCurrentProcess(), &vtbl[index], sizeof(void *));
+
+    if (g_vtable_patch_count < MAX_VTABLE_PATCHES) {
+        g_vtable_patches[g_vtable_patch_count].vtbl = vtbl;
+        g_vtable_patches[g_vtable_patch_count].index = index;
+        g_vtable_patches[g_vtable_patch_count].orig = orig;
+        g_vtable_patch_count++;
+    }
+    LeaveCriticalSection(&g_vtable_lock);
+    return orig;
+}
+
+/* ------------------------------------------------------------------ */
+/* CreateDevice / CreateDeviceEx hooks                                */
+/* ------------------------------------------------------------------ */
+
+static void log_present_params(const char *what, const d3dpp_safe *p) {
+    if (!p) {
+        return;
+    }
+    LOG_INFO("%s: %ux%u fmt=%u buffers=%u swap=%u windowed=%d refresh=%u interval=0x%08X flags=0x%X",
+             what, p->BackBufferWidth, p->BackBufferHeight, p->BackBufferFormat,
+             p->BackBufferCount, p->SwapEffect, (int)p->Windowed,
+             p->FullScreen_RefreshRateInHz, p->PresentationInterval, p->Flags);
+}
+
+static HRESULT STDMETHODCALLTYPE createdevice_hook(
+    void *self, UINT adapter, UINT device_type, HWND focus_window,
+    DWORD behavior_flags, void *present_params, void **device_out) {
+    d3dpp_safe *p = (d3dpp_safe *)present_params;
+    UINT saved_interval = 0;
+    int modified = 0;
+    HRESULT hr;
+
+    log_present_params("CreateDevice", p);
+
+    if (p && g_cfg.force_immediate && g_pacing_enabled && !g_measure_only &&
+        p->PresentationInterval != PRESENT_INTERVAL_IMMEDIATE) {
+        saved_interval = p->PresentationInterval;
+        p->PresentationInterval = PRESENT_INTERVAL_IMMEDIATE;
+        modified = 1;
+        LOG_INFO("CreateDevice: PresentationInterval 0x%08X -> IMMEDIATE (vsync off)",
+                 saved_interval);
+    }
+
+    hr = ((create_device_t)g_real_createdevice)(
+        self, adapter, device_type, focus_window, behavior_flags, present_params, device_out);
+
+    if (FAILED(hr) && modified) {
+        LOG_WARN("CreateDevice failed (0x%08X) with IMMEDIATE, retrying with the game's parameters", hr);
+        p->PresentationInterval = saved_interval;
+        hr = ((create_device_t)g_real_createdevice)(
+            self, adapter, device_type, focus_window, behavior_flags, present_params, device_out);
+    }
+
+    if (SUCCEEDED(hr)) {
+        LOG_INFO("CreateDevice ok (0x%08X) device=%p", hr, device_out ? *device_out : NULL);
+        if (device_out) {
+            do_install_device_hooks(*device_out);
+        }
+    } else {
+        LOG_WARN("CreateDevice failed (0x%08X)", hr);
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE createdeviceex_hook(
+    void *self, UINT adapter, UINT device_type, HWND focus_window,
+    DWORD behavior_flags, void *present_params, void *fullscreen_mode, void **device_out) {
+    d3dpp_safe *p = (d3dpp_safe *)present_params;
+    UINT saved_interval = 0;
+    int modified = 0;
+    HRESULT hr;
+
+    log_present_params("CreateDeviceEx", p);
+
+    if (p && g_cfg.force_immediate && g_pacing_enabled && !g_measure_only &&
+        p->PresentationInterval != PRESENT_INTERVAL_IMMEDIATE) {
+        saved_interval = p->PresentationInterval;
+        p->PresentationInterval = PRESENT_INTERVAL_IMMEDIATE;
+        modified = 1;
+        LOG_INFO("CreateDeviceEx: PresentationInterval 0x%08X -> IMMEDIATE (vsync off)",
+                 saved_interval);
+    }
+
+    hr = ((create_device_ex_t)g_real_createdeviceex)(
+        self, adapter, device_type, focus_window, behavior_flags, present_params,
+        fullscreen_mode, device_out);
+
+    if (FAILED(hr) && modified) {
+        LOG_WARN("CreateDeviceEx failed (0x%08X) with IMMEDIATE, retrying with the game's parameters", hr);
+        p->PresentationInterval = saved_interval;
+        hr = ((create_device_ex_t)g_real_createdeviceex)(
+            self, adapter, device_type, focus_window, behavior_flags, present_params,
+            fullscreen_mode, device_out);
+    }
+
+    if (SUCCEEDED(hr)) {
+        LOG_INFO("CreateDeviceEx ok (0x%08X) device=%p", hr, device_out ? *device_out : NULL);
+        if (device_out) {
+            do_install_device_hooks(*device_out);
+        }
+    } else {
+        LOG_WARN("CreateDeviceEx failed (0x%08X)", hr);
+    }
+    return hr;
+}
+
+/* ------------------------------------------------------------------ */
+/* Present hooks                                                      */
+/* ------------------------------------------------------------------ */
+
+static HRESULT STDMETHODCALLTYPE present_hook(
+    void *self, const RECT *src, const RECT *dst, HWND window, const RGNDATA *dirty) {
+    InterlockedIncrement64(&g_ev_present);
+    if (self == g_paced_device && g_pace_point == PACE_DEVICE) {
+        pace_frame();
+    }
+    return ((present_t)g_real_present)(self, src, dst, window, dirty);
+}
+
+static HRESULT STDMETHODCALLTYPE presentex_hook(
+    void *self, const RECT *src, const RECT *dst, HWND window,
+    const RGNDATA *dirty, DWORD flags) {
+    InterlockedIncrement64(&g_ev_present);
+    if (self == g_paced_device && g_pace_point == PACE_DEVICE) {
+        pace_frame();
+    }
+    return ((present_ex_t)g_real_presentex)(self, src, dst, window, dirty, flags);
+}
+
+/* The first swap chain instance that presents is treated as the primary one:
+   the game presents two swap chains per frame (main screen + subscreen) and both
+   share this vtable, so pacing every present would hold the loop back twice per
+   frame and run the game at half speed. */
+static void *g_primary_swapchain;
+
+static HRESULT STDMETHODCALLTYPE swapchain_present_hook(
+    void *self, const RECT *src, const RECT *dst, HWND window,
+    const RGNDATA *dirty, DWORD flags) {
+    InterlockedIncrement64(&g_ev_swapchain);
+    if (!g_primary_swapchain) {
+        if (InterlockedCompareExchangePointer(&g_primary_swapchain, self, NULL) == NULL) {
+            LOG_INFO("primary swap chain instance: %p (further instances are ignored "
+                     "for pacing)", self);
+        }
+    }
+    if (self == g_primary_swapchain && g_pace_point == PACE_SWAPCHAIN) {
+        pace_frame();
+    }
+    return ((swapchain_present_t)g_real_sc_present)(self, src, dst, window, dirty, flags);
+}
+
+static void do_install_device_hooks(void *device) {
+    if (!device) {
+        return;
+    }
+    if (g_paced_device && g_paced_device != device) {
+        LOG_INFO("additional device %p created (primary is %p), not paced",
+                 device, g_paced_device);
+        return;
+    }
+    if (!g_paced_device) {
+        g_paced_device = device;
+    }
+    if (!g_pacing_enabled) {
+        return;
+    }
+    if (g_cfg.pace_at != PACE_AUTO) {
+        InterlockedExchange(&g_pace_point, g_cfg.pace_at);
+    }
+
+    /* 1) the implicit swap chain (index 0): this is where the real game
+       presents from, and it is the most accurate place to hold the loop back */
+    if (g_cfg.pace_at == PACE_AUTO || g_cfg.pace_at == PACE_SWAPCHAIN) {
+        void *swapchain = NULL;
+        get_swapchain_t get_swapchain =
+            (get_swapchain_t)((*(void ***)device)[VTBL_DEVICE_GETSWAPCHAIN]);
+        if (get_swapchain &&
+            SUCCEEDED(get_swapchain(device, 0, &swapchain)) && swapchain) {
+            g_real_sc_present = vtable_patch(swapchain, VTBL_SWAPCHAIN_PRESENT,
+                                             (void *)swapchain_present_hook);
+            if (g_real_sc_present) {
+                LOG_INFO("device %p: implicit swap chain %p Present hooked (real %p)",
+                         device, swapchain, g_real_sc_present);
+            } else {
+                LOG_WARN("device %p: could not hook the swap chain Present", device);
+            }
+            /* drop our reference; the patch lives in the shared vtable */
+            ((release_t)((*(void ***)swapchain)[VTBL_RELEASE]))(swapchain);
+        } else {
+            LOG_INFO("device %p: GetSwapChain(0) failed, no swap chain hook", device);
+        }
+    }
+
+    /* 2) IDirect3DDevice9(Ex)::Present / PresentEx */
+    if (g_cfg.hook_present) {
+        g_real_present = vtable_patch(device, VTBL_DEVICE_PRESENT, (void *)present_hook);
+        if (g_cfg.hook_presentex) {
+            g_real_presentex = vtable_patch(device, VTBL_DEVICE_PRESENTEX, (void *)presentex_hook);
+        }
+        if (g_real_present) {
+            InterlockedExchange(&g_device_hooked, 1);
+            LOG_INFO("device %p: Present hooked (real %p), PresentEx %s",
+                     device, g_real_present, g_cfg.hook_presentex ? "hooked" : "not hooked");
+        } else {
+            LOG_WARN("could not hook Present on device %p", device);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* IDirect3D9(Ex) capture                                             */
+/* ------------------------------------------------------------------ */
+
+static void *d3d_create_hook(void *d3d) {
+    if (d3d) {
+        void *o1 = vtable_patch(d3d, VTBL_IDIRECT3D9_CREATEDEVICE, (void *)createdevice_hook);
+        void *o2 = vtable_patch(d3d, VTBL_IDIRECT3D9_CREATEDEVICEEX, (void *)createdeviceex_hook);
+        if (o1) {
+            g_real_createdevice = o1;
+        }
+        if (o2) {
+            g_real_createdeviceex = o2;
+        }
+        LOG_INFO("IDirect3D9 object %p hooked (CreateDevice=%p CreateDeviceEx=%p)",
+                 d3d, g_real_createdevice, g_real_createdeviceex);
+    }
+    return d3d;
+}
+
+static HRESULT WINAPI d3dcreate9ex_hook(UINT sdk_version, void **out) {
+    HRESULT hr = ((d3dcreate9ex_t)g_real_d3dcreate9ex)(sdk_version, out);
+    if (SUCCEEDED(hr) && out && *out) {
+        *out = d3d_create_hook(*out);
+    }
+    return hr;
+}
+
+static void *WINAPI d3dcreate9_hook(UINT sdk_version) {
+    void *d3d = ((d3dcreate9_t)g_real_d3dcreate9)(sdk_version);
+    return d3d_create_hook(d3d);
+}
+
+/* ------------------------------------------------------------------ */
+/* EnumDisplaySettings hooks                                          */
+/* ------------------------------------------------------------------ */
+
+static void spoof_devmode_a(DEVMODEA *dm, DWORD mode_num) {
+    if (!dm || !g_spoof_on || g_measure_only) {
+        return;
+    }
+    if (mode_num == ENUM_CURRENT_SETTINGS || g_cfg.spoof_all_modes) {
+        if (dm->dmDisplayFrequency != (DWORD)g_target_fps) {
+            LOG_MISC("EnumDisplaySettingsA mode=%lu %lux%lu %lubpp %luHz -> %ldHz",
+                     (unsigned long)mode_num,
+                     (unsigned long)dm->dmPelsWidth, (unsigned long)dm->dmPelsHeight,
+                     (unsigned long)dm->dmBitsPerPel, (unsigned long)dm->dmDisplayFrequency,
+                     (long)g_target_fps);
+            dm->dmDisplayFrequency = (DWORD)g_target_fps;
+        }
+    }
+}
+
+static void spoof_devmode_w(DEVMODEW *dm, DWORD mode_num) {
+    if (!dm || !g_spoof_on || g_measure_only) {
+        return;
+    }
+    if (mode_num == ENUM_CURRENT_SETTINGS || g_cfg.spoof_all_modes) {
+        if (dm->dmDisplayFrequency != (DWORD)g_target_fps) {
+            LOG_MISC("EnumDisplaySettingsW mode=%lu %lux%lu %lubpp %luHz -> %ldHz",
+                     (unsigned long)mode_num,
+                     (unsigned long)dm->dmPelsWidth, (unsigned long)dm->dmPelsHeight,
+                     (unsigned long)dm->dmBitsPerPel, (unsigned long)dm->dmDisplayFrequency,
+                     (long)g_target_fps);
+            dm->dmDisplayFrequency = (DWORD)g_target_fps;
+        }
+    }
+}
+
+static BOOL WINAPI eds_a_hook(LPCSTR device, DWORD mode, DEVMODEA *dm) {
+    BOOL r = ((eds_a_t)g_real_edsa)(device, mode, dm);
+    if (r) {
+        spoof_devmode_a(dm, mode);
+    }
+    return r;
+}
+
+static BOOL WINAPI eds_w_hook(LPCWSTR device, DWORD mode, DEVMODEW *dm) {
+    BOOL r = ((eds_w_t)g_real_edsw)(device, mode, dm);
+    if (r) {
+        spoof_devmode_w(dm, mode);
+    }
+    return r;
+}
+
+static BOOL WINAPI eds_exa_hook(LPCSTR device, DWORD mode, DEVMODEA *dm, DWORD flags) {
+    BOOL r = ((eds_exa_t)g_real_edsexa)(device, mode, dm, flags);
+    if (r) {
+        spoof_devmode_a(dm, mode);
+    }
+    return r;
+}
+
+static BOOL WINAPI eds_exw_hook(LPCWSTR device, DWORD mode, DEVMODEW *dm, DWORD flags) {
+    BOOL r = ((eds_exw_t)g_real_edsexw)(device, mode, dm, flags);
+    if (r) {
+        spoof_devmode_w(dm, mode);
+    }
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* spice2x d3d9 callback: telemetry and draw based pacing fallback    */
+/* ------------------------------------------------------------------ */
+
+static void __cdecl d3d9_callback(
+    SPICE_SDK_D3D9_EVENT event, const SPICE_SDK_D3D9_FRAME *frame, void *userdata) {
+    (void)frame;
+    (void)userdata;
+    if (event == SPICE_SDK_D3D9_READY) {
+        InterlockedExchange(&g_draw_seen, 1);
+        return;
+    }
+    if (event != SPICE_SDK_D3D9_DRAW) {
+        return;
+    }
+    {
+        LARGE_INTEGER now;
+        LONGLONG prev;
+        QueryPerformanceCounter(&now);
+        prev = (LONGLONG)InterlockedExchange64(&g_ev_last_qpc, now.QuadPart);
+        if (prev > 0) {
+            LONGLONG gap = now.QuadPart - prev;
+            if (gap > 0) {
+                LONGLONG mn = (LONGLONG)InterlockedCompareExchange64(&g_ev_min_gap, gap, 0);
+                LONGLONG mx;
+                if (mn == 0 || gap < mn) {
+                    InterlockedExchange64(&g_ev_min_gap, gap);
+                }
+                mx = (LONGLONG)InterlockedCompareExchange64(&g_ev_max_gap, gap, 0);
+                if (mx == 0 || gap > mx) {
+                    InterlockedExchange64(&g_ev_max_gap, gap);
+                }
+            }
+        }
+    }
+    InterlockedIncrement64(&g_ev_draw);
+    if (g_pace_point == PACE_DRAW) {
+        pace_frame();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* legacy millisecond clocks -> QueryPerformanceCounter               */
+/* ------------------------------------------------------------------ */
+
+/* bm2dx.dll imports timeGetTime/GetTickCount from winmm/kernel32: those are
+   the 1ms-resolution clocks the game was written against.  Feeding them a
+   QPC derived value keeps the same unit and the same 32 bit wrap-around
+   behaviour, only with the resolution of the high precision timer. */
+static DWORD qpc_millis32(void) {
+    LARGE_INTEGER now;
+    LONGLONG ticks;
+    QueryPerformanceCounter(&now);
+    ticks = now.QuadPart - g_qpc_epoch.QuadPart;
+    if (ticks < 0) {
+        ticks = 0;
+    }
+    return (DWORD)((ticks * 1000) / g_qpf.QuadPart);
+}
+
+static DWORD WINAPI timegettime_hook(void) {
+    return qpc_millis32();
+}
+
+static DWORD WINAPI gettickcount_hook(void) {
+    return qpc_millis32();
+}
+
+static ULONGLONG WINAPI gettickcount64_hook(void) {
+    LARGE_INTEGER now;
+    LONGLONG ticks;
+    QueryPerformanceCounter(&now);
+    ticks = now.QuadPart - g_qpc_epoch.QuadPart;
+    if (ticks < 0) {
+        ticks = 0;
+    }
+    return (ULONGLONG)((ticks * 1000) / g_qpf.QuadPart);
+}
+
+/* ------------------------------------------------------------------ */
+/* worker thread                                                      */
+/* ------------------------------------------------------------------ */
+
+static int key_down(int vk) {
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+static const char *pace_point_name(void) {
+    switch (InterlockedCompareExchange(&g_pace_point, 0, 0)) {
+        case PACE_SWAPCHAIN: return "swapchain";
+        case PACE_DEVICE:    return "present";
+        case PACE_DRAW:      return "draw";
+        default:             return "auto/undecided";
+    }
+}
+
+/* higher value = preferred pacing point (the order depends on the variant) */
+static void log_status(void) {
+    LOG_INFO("STATUS target=%ld fps | paced=%lld late=%lld skipped=%lld | swapchain=%lld "
+             "present=%lld draw=%lld | pacePoint=%s | refreshSpoof=%d | deviceHooked=%ld",
+             (long)g_target_fps,
+             (long long)g_ev_paced, (long long)g_ev_late, (long long)g_ev_skipped,
+             (long long)g_ev_swapchain, (long long)g_ev_present, (long long)g_ev_draw,
+             pace_point_name(),
+             InterlockedCompareExchange(&g_spoof_on, 0, 0), (long)g_device_hooked);
+}
+
+/* Ctrl+Shift+F9  cycle target rate 120 <-> 60
+   Ctrl+Shift+F10 toggle the monitor refresh spoof
+   Ctrl+Shift+F11 print a status line into the spice log */
+static void handle_hotkeys(void) {
+    static int prev9, prev10, prev11;
+    int combo = key_down(VK_CONTROL) && key_down(VK_SHIFT);
+    int k9 = combo && key_down(VK_F9);
+    int k10 = combo && key_down(VK_F10);
+    int k11 = combo && key_down(VK_F11);
+
+    if (k9 && !prev9) {
+        int next;
+        int old = g_target_fps;
+        if (g_target_fps == 120) {
+            next = 60;
+        } else if (g_target_fps == 60) {
+            next = 120;
+        } else {
+            next = (g_target_fps == 30) ? 120 : 30;
+        }
+        g_target_fps = next;
+        g_period_ticks = (double)g_qpf.QuadPart / (double)next;
+        g_pacer_started = 0;
+        LOG_INFO("hotkey: target frame rate %d -> %d fps", old, next);
+    }
+    if (k10 && !prev10) {
+        LONG v = InterlockedCompareExchange(&g_spoof_on, 0, 0) ? 0 : 1;
+        InterlockedExchange(&g_spoof_on, v);
+        LOG_INFO("hotkey: display refresh spoof %s", v ? "ON" : "OFF");
+    }
+    if (k11 && !prev11) {
+        log_status();
+    }
+    prev9 = k9;
+    prev10 = k10;
+    prev11 = k11;
+}
+
+static int g_desktop_refresh;
+static int g_off_target_ticks;
+static volatile LONG g_offtarget_logged;
+
+/* A small, self contained status file next to the DLL.  Players can send this
+   single file back instead of digging through spice's (large) log. */
+static char g_report_path[MAX_PATH];
+
+static void report_append(HANDLE f, const char *fmt, ...) {
+    char line[512];
+    DWORD written = 0;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line) - 3, fmt, ap);
+    va_end(ap);
+    strcat(line, "\r\n");
+    WriteFile(f, line, (DWORD)strlen(line), &written, NULL);
+}
+
+static void write_report(double fps_draw, double fps_swapchain, double fps_present,
+                         long long paced_per_s, long long late, long long skipped,
+                         double gap_min_ms, double gap_max_ms) {
+    char line[LOG_RING_LEN + 8];
+    HANDLE f;
+    DWORD written = 0;
+    int i;
+    LONG ring;
+    SYSTEMTIME st;
+
+    if (g_report_path[0] == '\0' || g_cfg.log_fps == 0) {
+        return;
+    }
+    f = CreateFileA(g_report_path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    GetLocalTime(&st);
+    ring = InterlockedCompareExchange(&g_log_ring_next, 0, 0);
+
+    report_append(f, "iidxfps %s - beatmania IIDX frame timing report", IIDXFPS_VERSION);
+    report_append(f, "generated: %04d-%02d-%02d %02d:%02d:%02d",
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    report_append(f, "config   : Enabled=%d FPS=%s target=%ld PaceAt=%s ForceImmediatePresent=%d",
+                  g_cfg.enabled, g_cfg.target_fps ? "fixed" : "auto", (long)g_target_fps,
+                  pace_point_name(), g_cfg.force_immediate);
+    report_append(f, "           SpoofDisplayRefresh=%d SpoofAllModes=%d HighPrecisionTime=%d",
+                  g_cfg.spoof_refresh, g_cfg.spoof_all_modes, g_cfg.high_precision_time);
+    report_append(f, "           MeasureOnly=%d SkipWhenRefreshMatches=%d ForcePacing=%d",
+                  g_cfg.measure_only, g_cfg.skip_when_match, g_cfg.force_pacing);
+    report_append(f, "           HookPresent=%d HookPresentEx=%d register_d3d9=%s",
+                  g_cfg.hook_present, g_cfg.hook_presentex,
+                  g_spice.register_d3d9 ? "yes" : "no");
+    report_append(f, "desktop  : %dHz   game is told %ldHz",
+                  g_desktop_refresh, (long)(g_spoof_on ? g_target_fps : g_desktop_refresh));
+    report_append(f, "pacing   : %s   pacePoint=%s   deviceHooked=%ld",
+                  g_measure_only ? "measure only"
+                                 : (g_pacing_enabled ? "ENABLED (QPC schedule, vsync off)"
+                                                     : "hands off (refresh matches)"),
+                  pace_point_name(), (long)g_device_hooked);
+    report_append(f, "frames/s : draw=%.2f swapchain=%.2f present=%.2f paced=%.0f "
+                     "late=%lld skipped=%lld",
+                  fps_draw, fps_swapchain, fps_present, (double)paced_per_s,
+                  (long long)late, (long long)skipped);
+    report_append(f, "frame gap: %.3f .. %.3f ms", gap_min_ms, gap_max_ms);
+    if (g_halfspeed_logged) {
+        report_append(f, "WARNING  : pacing ran more than once per frame (half speed) - "
+                         "try HookPresentEx=0");
+    }
+    if (g_offtarget_logged) {
+        report_append(f, "WARNING  : hands off but the game does not run at the target rate - "
+                         "set ForcePacing=1");
+    }
+    report_append(f, "--- last messages (oldest first), ring next=%ld size=%d ---", (long)ring, LOG_RING_SIZE);
+    for (i = 0; i < LOG_RING_SIZE; i++) {
+        LONG slot = (ring + i) % LOG_RING_SIZE;
+        const char *msg = g_log_ring[slot];
+        if (msg[0] == '\0') {
+            continue;
+        }
+        _snprintf(line, sizeof(line) - 1, "%s", msg);
+        line[sizeof(line) - 1] = '\0';
+        report_append(f, "[%02ld] %s", slot, line);
+    }
+    (void)written;
+    CloseHandle(f);
+}
+
+
+static void log_display_state(void) {
+    DEVMODEA dm;
+    memset(&dm, 0, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    g_desktop_refresh = 0;
+    if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) {
+        g_desktop_refresh = (int)dm.dmDisplayFrequency;
+        LOG_INFO("desktop mode: %lux%lu %lubpp %luHz (game is told %ldHz)",
+                 (unsigned long)dm.dmPelsWidth, (unsigned long)dm.dmPelsHeight,
+                 (unsigned long)dm.dmBitsPerPel, (unsigned long)dm.dmDisplayFrequency,
+                 (long)(g_cfg.spoof_refresh ? g_target_fps : (LONG)dm.dmDisplayFrequency));
+    }
+}
+
+/* Decide whether to touch anything at all.
+ *
+ * If the desktop already runs at (very close to) the rate the game needs, the
+ * game's own vsync is already keeping it at the right speed and turning vsync
+ * off would only add tearing.  In that case stay completely hands off; the user
+ * can force exact timing with ForcePacing=1.
+ */
+static void decide_pacing(void) {
+    int target = (int)g_target_fps;
+    int diff;
+
+    g_pacing_enabled = g_cfg.enabled && !g_measure_only;
+    if (!g_pacing_enabled) {
+        return;
+    }
+    if (g_cfg.force_pacing || !g_cfg.skip_when_match || g_desktop_refresh <= 0) {
+        return;
+    }
+    diff = g_desktop_refresh - target;
+    if (diff < 0) {
+        diff = -diff;
+    }
+    if (diff * 100 <= target * 3) {
+        g_pacing_enabled = 0;
+        LOG_INFO("desktop refresh %dHz already matches the target %d fps: leaving vsync and "
+                 "the frame rate alone so the picture stays tear free "
+                 "(set ForcePacing=1 in " INI_NAME " to force exact QPC timing anyway)",
+                 g_desktop_refresh, target);
+    }
+}
+
+static void install_game_hooks(void) {
+    if (!g_cfg.enabled || g_measure_only) {
+        LOG_INFO("MeasureOnly / disabled: no hooks installed, only measuring");
+        return;
+    }
+
+    if (g_pacing_enabled) {
+        int n = 0;
+        n += iat_hook(g_game_module, "d3d9.dll", "Direct3DCreate9Ex",
+                      (void *)d3dcreate9ex_hook, &g_real_d3dcreate9ex);
+        n += iat_hook(g_game_module, "d3d9.dll", "Direct3DCreate9",
+                      (void *)d3dcreate9_hook, &g_real_d3dcreate9);
+        LOG_INFO("d3d9 entry points hooked in bm2dx.dll: %d", n);
+        if (n == 0) {
+            LOG_WARN("could not hook Direct3DCreate9Ex in bm2dx.dll "
+                     "(device creation will not be intercepted)");
+        }
+    }
+
+    if (g_cfg.spoof_refresh) {
+        int n = 0;
+        n += iat_hook(g_game_module, "user32.dll", "EnumDisplaySettingsA",
+                      (void *)eds_a_hook, &g_real_edsa);
+        n += iat_hook(g_game_module, "user32.dll", "EnumDisplaySettingsW",
+                      (void *)eds_w_hook, &g_real_edsw);
+        n += iat_hook(g_game_module, "user32.dll", "EnumDisplaySettingsExA",
+                      (void *)eds_exa_hook, &g_real_edsexa);
+        n += iat_hook(g_game_module, "user32.dll", "EnumDisplaySettingsExW",
+                      (void *)eds_exw_hook, &g_real_edsexw);
+        LOG_INFO("EnumDisplaySettings imports hooked: %d (reporting %ldHz)",
+                 n, (long)g_target_fps);
+        if (n == 0) {
+            LOG_WARN("bm2dx.dll does not import EnumDisplaySettings*, refresh spoof is a no-op");
+        }
+    }
+
+    if (g_cfg.high_precision_time) {
+        int n = 0;
+        n += iat_hook(g_game_module, "winmm.dll", "timeGetTime",
+                      (void *)timegettime_hook, &g_real_timegettime);
+        n += iat_hook(g_game_module, "kernel32.dll", "GetTickCount",
+                      (void *)gettickcount_hook, &g_real_gettickcount);
+        n += iat_hook(g_game_module, "kernel32.dll", "GetTickCount64",
+                      (void *)gettickcount64_hook, &g_real_gettickcount64);
+        LOG_INFO("millisecond clocks replaced by QPC derived values: %d import(s)", n);
+    }
+}
+
+static unsigned __stdcall worker_thread(void *arg) {
+    LARGE_INTEGER last;
+    LONG64 last_present = 0, last_draw = 0, last_paced = 0;
+    int ticks = 0;
+    int i;
+
+    (void)arg;
+
+    for (i = 0; i < 120000; i++) {
+        g_game_module = GetModuleHandleA("bm2dx.dll");
+        if (!g_game_module) {
+            g_game_module = GetModuleHandleA("bm2dx_omni.dll");
+        }
+        if (g_game_module) {
+            break;
+        }
+        Sleep(1);
+    }
+    if (!g_game_module) {
+        LOG_WARN("bm2dx.dll was not loaded within 120s, giving up");
+        return 0;
+    }
+    LOG_INFO("game module found at %p", g_game_module);
+
+    resolve_target_fps();
+    log_display_state();
+    decide_pacing();
+
+    LOG_INFO("pacing: %s, target %ld fps, pacing point = %s",
+             g_pacing_enabled ? "ENABLED" : "disabled", (long)g_target_fps, pace_point_name());
+
+    install_game_hooks();
+
+    QueryPerformanceCounter(&last);
+    {
+        double accum = 1.0;
+        LONG64 last_swapchain = 0;
+        LONG64 sel_sc = 0, sel_dv = 0, sel_dr = 0;
+        for (;;) {
+            LARGE_INTEGER now;
+            double dt;
+            LONG64 swapchain, present, draw, paced, late, skipped;
+
+            Sleep(20);
+
+            QueryPerformanceCounter(&now);
+            dt = (double)(now.QuadPart - last.QuadPart) / (double)g_qpf.QuadPart;
+            last = now;
+            accum += dt;
+
+            handle_hotkeys();
+
+            /* Pick the pacing point that is really being called, sampled every 20ms.
+               The spice draw callback fires exactly once per game frame, which is
+               what we want to pace, so it wins over the swap chain (twice per
+               frame here) and over the device present (never called here).
+               Switching to a *lower* priority point only happens when the current
+               one went completely silent, which stops the selection from flapping. */
+            if (g_pacing_enabled && g_cfg.pace_at == PACE_AUTO) {
+                LONG64 cs = (LONG64)InterlockedCompareExchange64(&g_ev_swapchain, 0, 0);
+                LONG64 cd = (LONG64)InterlockedCompareExchange64(&g_ev_present, 0, 0);
+                LONG64 cr = (LONG64)InterlockedCompareExchange64(&g_ev_draw, 0, 0);
+                LONG64 ds = cs - sel_sc, dd = cd - sel_dv, dr = cr - sel_dr;
+                int cur = InterlockedCompareExchange(&g_pace_point, 0, 0);
+                int cur_events;
+                int sel = 0;
+
+                if (dr > 0) {
+                    sel = PACE_DRAW;
+                } else if (ds > 0) {
+                    sel = PACE_SWAPCHAIN;
+                } else if (dd > 0) {
+                    sel = PACE_DEVICE;
+                }
+
+                cur_events = (cur == PACE_DRAW) ? (int)dr
+                           : (cur == PACE_SWAPCHAIN) ? (int)ds
+                           : (cur == PACE_DEVICE) ? (int)dd : 0;
+                sel_sc = cs;
+                sel_dv = cd;
+                sel_dr = cr;
+
+                if (sel && sel != cur &&
+                    (sel > cur || cur_events == 0)) {
+                    InterlockedExchange(&g_pace_point, sel);
+                    g_pacer_started = 0;
+                    LOG_INFO("pacing point selected: %s", pace_point_name());
+                }
+            }
+
+            if (accum < 1.0) {
+                continue;
+            }
+            dt = accum;
+            accum = 0.0;
+            ticks++;
+
+            swapchain = (LONG64)InterlockedCompareExchange64(&g_ev_swapchain, 0, 0);
+            present = (LONG64)InterlockedCompareExchange64(&g_ev_present, 0, 0);
+            draw = (LONG64)InterlockedCompareExchange64(&g_ev_draw, 0, 0);
+            paced = (LONG64)InterlockedCompareExchange64(&g_ev_paced, 0, 0);
+            late = (LONG64)InterlockedCompareExchange64(&g_ev_late, 0, 0);
+            skipped = (LONG64)InterlockedCompareExchange64(&g_ev_skipped, 0, 0);
+
+            /* hands off because the desktop already matches the target: make sure
+               the game really does run at the rate the display promises, and tell
+               the user how to force exact timing if it does not */
+            if (!g_pacing_enabled && !g_measure_only && !g_cfg.force_pacing) {
+                double measured = (double)(draw - last_draw) / dt;
+                if (draw - last_draw <= 0) {
+                    measured = (double)(swapchain - last_swapchain) / dt;
+                }
+                if (measured > 1.0 && ticks >= 3 &&
+                    (measured > (double)g_target_fps * 1.015 ||
+                     measured < (double)g_target_fps * 0.985)) {
+                    g_off_target_ticks++;
+                    if (g_off_target_ticks == 5 &&
+                        !InterlockedCompareExchange(&g_offtarget_logged, 1, 0)) {
+                        LOG_WARN("the game runs at %.2f fps but the target is %ld fps although "
+                                 "the desktop reports %dHz; set ForcePacing=1 in " INI_NAME
+                                 " to lock it with the high precision timer",
+                                 measured, (long)g_target_fps, g_desktop_refresh);
+                    }
+                } else {
+                    g_off_target_ticks = 0;
+                }
+            }
+
+            {
+                LONG64 mn = (LONG64)InterlockedExchange64(&g_ev_min_gap, 0);
+                LONG64 mx = (LONG64)InterlockedExchange64(&g_ev_max_gap, 0);
+                double mn_ms = mn > 0 ? (double)mn * 1000.0 / (double)g_qpf.QuadPart : 0.0;
+                double mx_ms = mx > 0 ? (double)mx * 1000.0 / (double)g_qpf.QuadPart : 0.0;
+
+                if (g_cfg.log_fps) {
+                    LOG_MISC("fps(swapchain)=%.2f fps(present)=%.2f fps(draw)=%.2f pacePoint=%s "
+                             "paced=%lld late=%lld skip=%lld gap=%.3f..%.3f ms target=%ld",
+                             (double)(swapchain - last_swapchain) / dt,
+                             (double)(present - last_present) / dt,
+                             (double)(draw - last_draw) / dt,
+                             pace_point_name(),
+                             (long long)(paced - last_paced),
+                             (long long)late, (long long)skipped,
+                             mn_ms, mx_ms,
+                             (long)g_target_fps);
+                }
+
+                write_report((double)(draw - last_draw) / dt,
+                             (double)(swapchain - last_swapchain) / dt,
+                             (double)(present - last_present) / dt,
+                             (long long)(paced - last_paced), late, skipped,
+                             mn_ms, mx_ms);
+            }
+
+            /* both Present and PresentEx hooked and both being called would
+               slow the game to half speed: say so loudly */
+            if (InterlockedCompareExchange(&g_pace_point, 0, 0) == PACE_DEVICE &&
+                g_cfg.hook_presentex && (paced - last_paced) > (LONG64)g_target_fps * 3 / 2 &&
+                !InterlockedCompareExchange(&g_halfspeed_logged, 1, 0)) {
+                LOG_WARN("pacing runs %.2f times per frame: the game appears to call both "
+                         "Present and PresentEx, set HookPresentEx=0 in " INI_NAME,
+                         (double)(paced - last_paced) / dt);
+            }
+
+            last_swapchain = swapchain;
+            last_present = present;
+            last_draw = draw;
+            last_paced = paced;
+
+            if (ticks == 5 && g_pacing_enabled && !g_draw_seen && !g_device_hooked &&
+                !InterlockedCompareExchange(&g_fallback_logged, 1, 0)) {
+                LOG_WARN("no d3d9 device seen after 5s. If the game frame rate is still wrong, "
+                         "try PaceAt=draw in " INI_NAME);
+            }
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* entry points                                                       */
+/* ------------------------------------------------------------------ */
+
+static HANDLE g_thread;
+
+static void __cdecl destroy_callback(void) {
+    LOG_INFO("plugin unloading");
+    InterlockedExchange(&g_pacing_enabled, 0);
+}
+
+SPICE_SDK_ENTRY_POINT
+spice_sdk_entry_point(spice_sdk_init_func *init) {
+    SPICE_SDK_STATUS_CODE status;
+    char ini_path[MAX_PATH];
+    int have_ini = 0;
+
+    memset(&g_spice, 0, sizeof(g_spice));
+    memset(&g_cfg, 0, sizeof(g_cfg));
+    memset(ini_path, 0, sizeof(ini_path));
+    g_spice.size = sizeof(g_spice);
+    g_cfg.enabled = 1;
+    g_cfg.force_immediate = 1;
+    g_cfg.spoof_refresh = 1;
+    g_cfg.spoof_all_modes = 1;
+    g_cfg.log_fps = 1;
+    g_cfg.pace_at = 0;
+
+    status = init(0, destroy_callback, &g_spice);
+    if (status != SPICE_SDK_STATUS_SUCCESS) {
+        return 0;
+    }
+
+    InitializeCriticalSection(&g_log_lock);
+    g_log_lock_ready = 1;
+    InitializeCriticalSection(&g_vtable_lock);
+
+    if (g_spice.get_plugin_directory) {
+        wchar_t wide[MAX_PATH];
+        uint32_t size = MAX_PATH;
+        memset(wide, 0, sizeof(wide));
+        if (g_spice.get_plugin_directory((const void *)&spice_sdk_entry_point,
+                                         wide, &size) == SPICE_SDK_STATUS_SUCCESS) {
+            char narrow[MAX_PATH * 2];
+            size_t len;
+            memset(narrow, 0, sizeof(narrow));
+            WideCharToMultiByte(CP_ACP, 0, wide, -1, narrow, sizeof(narrow) - 1, NULL, NULL);
+            len = strlen(narrow);
+            while (len > 0 && (narrow[len - 1] == '\\' || narrow[len - 1] == '/')) {
+                narrow[--len] = '\0';
+            }
+            _snprintf(ini_path, sizeof(ini_path) - 1, "%s\\%s", narrow, INI_NAME);
+            have_ini = 1;
+        }
+    }
+    if (!have_ini) {
+        char exe[MAX_PATH];
+        char *slash;
+        memset(exe, 0, sizeof(exe));
+        GetModuleFileNameA(NULL, exe, sizeof(exe) - 1);
+        slash = strrchr(exe, '\\');
+        if (slash) {
+            *(slash + 1) = '\0';
+        }
+        _snprintf(ini_path, sizeof(ini_path) - 1, "%s%s", exe, INI_NAME);
+    }
+    ini_path[sizeof(ini_path) - 1] = '\0';
+
+    /* the report file sits next to the ini */
+    {
+        char dir[MAX_PATH];
+        size_t len;
+        memset(dir, 0, sizeof(dir));
+        _snprintf(dir, sizeof(dir) - 1, "%s", ini_path);
+        len = strlen(dir);
+        while (len > 0 && dir[len - 1] != '\\' && dir[len - 1] != '/') {
+            dir[--len] = '\0';
+        }
+        _snprintf(g_report_path, sizeof(g_report_path) - 1, "%s%s", dir, REPORT_NAME);
+        g_report_path[sizeof(g_report_path) - 1] = '\0';
+    }
+
+    config_init(ini_path);
+    LOG_INFO("iidxfps %s plugin loaded, config file: %s", IIDXFPS_VERSION, ini_path);
+    LOG_INFO("enabled=%d fps=%d paceAt=%s forceImmediate=%d spoofRefresh=%d spoofAllModes=%d "
+             "logFps=%d measureOnly=%d hookPresent=%d hookPresentEx=%d skipWhenMatch=%d "
+             "forcePacing=%d",
+             g_cfg.enabled, g_cfg.target_fps, pace_point_name(),
+             g_cfg.force_immediate, g_cfg.spoof_refresh, g_cfg.spoof_all_modes,
+             g_cfg.log_fps, g_cfg.measure_only, g_cfg.hook_present, g_cfg.hook_presentex,
+             g_cfg.skip_when_match, g_cfg.force_pacing);
+
+    if (!g_cfg.enabled) {
+        LOG_INFO("disabled by config, nothing to do");
+        return 1;
+    }
+
+    pacer_global_init();
+    InterlockedExchange(&g_measure_only, g_cfg.measure_only);
+    InterlockedExchange(&g_spoof_on, g_cfg.spoof_refresh);
+
+    if (g_spice.register_d3d9) {
+        status = g_spice.register_d3d9(d3d9_callback, NULL);
+        if (status == SPICE_SDK_STATUS_SUCCESS) {
+            LOG_INFO("registered for d3d9 events");
+        } else {
+            LOG_WARN("register_d3d9 failed (%d)", (int)status);
+        }
+    } else {
+        LOG_WARN("this spice build has no register_d3d9, using the d3d9 import hooks only");
+    }
+
+    g_thread = (HANDLE)_beginthreadex(NULL, 0, worker_thread, NULL, 0, NULL);
+    if (!g_thread) {
+        LOG_WARN("failed to start the worker thread");
+        return 0;
+    }
+
+    return 1;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
