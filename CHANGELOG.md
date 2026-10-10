@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.0.2
+
+* `FPS=auto` additionally reads **spicecfg's options file** (`%APPDATA%\spicetools.xml`, override with
+  the new `SpiceCfgPath` ini key). Users who enable TDJ mode in the GUI (rather than with `-iidxtdj`
+  on the command line) now get the right target rate *before* the game enumerates the display modes,
+  so the whole mode table and the refresh spoof are consistent from the first frame on.
+  spice2x treats a bool option as enabled only when its value is non-empty
+  (`<option name="iidxtdj" value="1"/>` on, `value=""` off).
+* Fixed a false positive in both instant matchers: every option whose name merely *contains*
+  `iidxtdj` used to count as TDJ. `-iidxtdjcamhook` and `-iidxtdjsubsize` persist after TDJ is
+  switched off, so a plain LDJ cabinet could be mistaken for TDJ and forced to 120 fps.
+  Only the actual mode switches (`iidxtdj`, `iidxtdjw`, `sp2x-iidxtdjw`) match now.
+* Fixed an out of bounds stack read in the new spicecfg chunked file reader (the carried
+  tail was taken from the wrong offset, so up to 2 kB past the read buffer were copied and
+  the process could crash right after `Direct3DCreate9Ex`). Verified in fullscreen, which is
+  how the reporter runs the game.* The report's `cabinet:` line lists all four signals (`cmdline=`, `spicecfg=`, `romfiles=`, the
+  game's own rom).
+
+
+
 ## v1.0.1
 
 Bug fix release: **TDJ cabinets were held at 60 fps with `FPS=auto`**, which made the game run at

@@ -67,15 +67,19 @@ the DLL, keeping the name `iidxfps.ini`. The important keys:
 
 ### How `FPS=auto` decides between TDJ and LDJ
 
-Three signals are tried in order; any of them means TDJ (120 fps):
+Four signals are tried in order; any of them means TDJ (120 fps):
 
-1. **the launcher command line** containing `iidxtdj` (`-iidxtdj`, `-iidxtdjw`, `-iidxtdjsubsize` …
-   every TDJ-only option contains that string, none of them exists for LDJ). This is known
-   instantly, so the whole display mode table and the refresh spoof are consistent from the first
-   frame on;
-2. `C:\000rom.txt` containing `TDJ-JA`, or `D:\001rom.txt` containing `TDJ` (the files spice2x
+1. **the launcher command line** carrying a TDJ mode switch (`-iidxtdj`, `-iidxtdjw`,
+   `-sp2x-iidxtdjw`). Only those switches count: `-iidxtdjcamhook` or `-iidxtdjsubsize` are merely
+   settings that stay behind after TDJ has been switched off;
+2. **the spicecfg options file** (`%APPDATA%\spicetools.xml`, overridable with `SpiceCfgPath` in the
+   ini) — that is where the GUI stores the checkbox. Note that spice2x treats a bool option as
+   enabled only when its value is non-empty: `<option name="iidxtdj" value="1"/>` is on, `value=""`
+   is off. Like the command line this is known instantly, so the display mode table and the refresh
+   spoof are consistent from the first frame on;
+3. `C:\000rom.txt` containing `TDJ-JA`, or `D:\001rom.txt` containing `TDJ` (the files spice2x
    itself reads);
-3. **the cabinet rom the game itself reads** (`/c_drv/000rom.txt`), asked for through
+4. **the cabinet rom the game itself reads** (`/c_drv/000rom.txt`), asked for through
    `avs2-core.dll` (in TDJ mode spice2x injects that rom in memory, there is no file on disk, and
    the core's export names are obfuscated and change between builds, so every naming scheme spice2x
    knows about is tried). This runs on the game's own thread (the `EnumDisplaySettings`,

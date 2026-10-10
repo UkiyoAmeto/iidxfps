@@ -81,7 +81,7 @@
 #define MODULE_TAG  "iidxfps"
 #define INI_NAME    "iidxfps.ini"
 #define REPORT_NAME "iidxfps_report.txt"
-#define IIDXFPS_VERSION "1.0.1"
+#define IIDXFPS_VERSION "1.0.2"
 
 #define DEFAULT_FPS_TDJ 120
 #define DEFAULT_FPS_LDJ 60
@@ -140,6 +140,7 @@ typedef struct {
     int target_fps;          /* 0 = auto */
     int pace_at;             /* 0 = present, 1 = draw */
     int force_immediate;
+    char spice_cfg_path[MAX_PATH];
     int spoof_refresh;
     int spoof_all_modes;
     int log_fps;
@@ -290,6 +291,8 @@ static void config_init(const char *ini_path) {
     g_cfg.enabled         = GetPrivateProfileIntA("General", "Enabled", 1, ini_path);
     g_cfg.force_immediate = GetPrivateProfileIntA("General", "ForceImmediatePresent", 1, ini_path);
     g_cfg.spoof_refresh   = GetPrivateProfileIntA("General", "SpoofDisplayRefresh", 1, ini_path);
+    GetPrivateProfileStringA("General", "SpiceCfgPath", "", g_cfg.spice_cfg_path,
+                             sizeof(g_cfg.spice_cfg_path) - 1, ini_path);
     g_cfg.spoof_all_modes = GetPrivateProfileIntA("General", "SpoofAllModes", 1, ini_path);
     g_cfg.log_fps         = GetPrivateProfileIntA("General", "LogFrameRate", 1, ini_path);
     g_cfg.measure_only    = GetPrivateProfileIntA("General", "MeasureOnly", 0, ini_path);
@@ -346,31 +349,172 @@ static int file_equals(const char *path, const char *expect) {
     return _stricmp(buf, expect) == 0;
 }
 
+/* spicecfg (the GUI) stores its options in %APPDATA%\spicetools.xml, so a TDJ
+   cabinet enabled there is another instant signal - no rom probe needed, and the
+   decision is made before the game enumerates a single display mode.
+   spice2x treats a bool option as enabled when its value is *non-empty*
+   (cfg/option.cpp: value_bool() { return !value.empty(); }), so
+       <option name="iidxtdj" value="1"/>   means enabled while
+       <option name="iidxtdj" value=""/>    means disabled.
+   The file also holds the user's card id and other private settings, so nothing
+   but the option name is ever logged. */
+static int buffer_has_tdj_option(const char *buf, size_t len) {
+    static const char name_attr[] = "name=\"";
+    static const char value_attr[] = "value=\"";
+    size_t i = 0;
+
+    while (i + sizeof(name_attr) - 1 <= len) {
+        size_t nstart, nend;
+
+        if (memcmp(buf + i, name_attr, sizeof(name_attr) - 1) != 0) {
+            i++;
+            continue;
+        }
+        nstart = i + sizeof(name_attr) - 1;
+        nend = nstart;
+        while (nend < len && buf[nend] != '"' && buf[nend] != '>') {
+            nend++;
+        }
+        if (nend - nstart < 7) {                       /* too short for iidxtdj */
+            i = nend;
+            continue;
+        }
+        {
+            size_t namelen = nend - nstart;
+            /* only the mode switches count: iidxtdj / iidxtdjw / sp2x-iidxtdjw.
+               Settings that merely mention tdj (iidxtdjcamhook, iidxtdjsubsize)
+               persist after TDJ is switched off, so they must not match. */
+            int is_switch = 0;
+            char name[64];
+            if (namelen < sizeof(name)) {
+                memcpy(name, buf + nstart, namelen);
+                name[namelen] = '\0';
+                is_switch = _stricmp(name, "iidxtdj") == 0 ||
+                            _stricmp(name, "iidxtdjw") == 0 ||
+                            _stricmp(name, "sp2x-iidxtdjw") == 0;
+            }
+            if (!is_switch) {
+                i = nend;
+                continue;
+            }
+        }
+        /* look for the value attribute of the same element */
+        {
+            size_t v = nend;
+            size_t limit = v + 512;
+            if (limit > len) {
+                limit = len;
+            }
+            while (v + sizeof(value_attr) - 1 <= limit) {
+                if (memcmp(buf + v, value_attr, sizeof(value_attr) - 1) == 0) {
+                    size_t vend = v + sizeof(value_attr) - 1;
+                    if (vend < len && buf[vend] != '"') {
+                        return 1;                      /* non-empty: enabled */
+                    }
+                    break;
+                }
+                if (buf[v] == '>') {
+                    break;                             /* element ended, no value */
+                }
+                v++;
+            }
+        }
+        i = nend;
+    }
+    return 0;
+}
+
+/* the file is a few hundred kB, so it is read in chunks; the last TAIL bytes of
+   every chunk are carried over so an element split across two reads is still
+   matched.  The carried length must always stay below the buffer size, otherwise
+   ReadFile is asked to write past it (and the memmove below would read past it). */
+#define SPICECFG_BUF_SIZE 16384
+#define SPICECFG_TAIL     4096
+
+static int spicecfg_says_tdj(const char *path) {
+    HANDLE f;
+    char buf[SPICECFG_BUF_SIZE];
+    DWORD got = 0;
+    size_t carry = 0;
+    int found = 0;
+
+    if (!path || !path[0]) {
+        return 0;
+    }
+    f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    for (;;) {
+        DWORD want = (DWORD)(sizeof(buf) - carry - 1);
+        size_t total;
+
+        if (want == 0 || !ReadFile(f, buf + carry, want, &got, NULL) || got == 0) {
+            break;
+        }
+        total = carry + got;
+        buf[total] = '\0';
+        if (buffer_has_tdj_option(buf, total)) {
+            found = 1;
+            break;
+        }
+        if (total > SPICECFG_TAIL) {
+            memmove(buf, buf + total - SPICECFG_TAIL, SPICECFG_TAIL);
+            carry = SPICECFG_TAIL;
+        } else {
+            carry = total;
+        }
+    }
+    CloseHandle(f);
+    return found;
+}
+
+static int spicecfg_config_says_tdj(void) {
+    char path[MAX_PATH];
+
+    if (g_cfg.spice_cfg_path[0]) {
+        return spicecfg_says_tdj(g_cfg.spice_cfg_path);
+    }
+    path[0] = '\0';
+    if (GetEnvironmentVariableA("APPDATA", path, sizeof(path)) == 0 ||
+        strlen(path) + 16 >= sizeof(path)) {
+        return 0;
+    }
+    strcat(path, "\\spicetools.xml");
+    return spicecfg_says_tdj(path);
+}
+
 /* Every TDJ related spice2x option contains "iidxtdj" (-iidxtdj, -iidxtdjw,
    -iidxtdjsubsize, -iidxtdjcamhook...), and none of them exists for the LDJ
    cabinet, so the launcher command line is an exact *and instant* answer.  It is
    read before the game enumerates a single display mode, which keeps the whole
    mode table and the refresh spoof consistent from the first frame on. */
 static int command_line_says_tdj(void) {
-    static const char needle[] = "iidxtdj";
-    const char *p = GetCommandLineA();
-    size_t i;
+    /* only the actual mode switches count: -iidxtdj / -iidxtdjw / -sp2x-iidxtdjw.
+       Options that merely start with it (-iidxtdjcamhook, -iidxtdjsubsize) can be
+       set while the cabinet is still LDJ, so they must not match.  An option name
+       starts right after - or / and ends at a delimiter. */
+    static const char *names[] = { "iidxtdjw", "iidxtdj", NULL };
+    const char *cmd = GetCommandLineA();
+    int n;
 
-    if (!p) {
+    if (!cmd) {
         return 0;
     }
-    for (; *p; p++) {
-        if ((char)(*p | 0x20) != needle[0]) {
-            continue;
-        }
-        for (i = 1; needle[i]; i++) {
-            char c = p[i];
-            if (!c || (char)(c | 0x20) != needle[i]) {
-                break;
+    for (n = 0; names[n]; n++) {
+        const char *p = cmd;
+        size_t len = strlen(names[n]);
+        while ((p = strstr(p, names[n])) != NULL) {
+            char before = (p == cmd) ? ' ' : p[-1];
+            char after = p[len];
+            int ok_before = (before == '-' || before == '/');
+            int ok_after = (after == '\0' || after == ' ' || after == '\t' ||
+                            after == '=' || after == '"');
+            if (ok_before && ok_after) {
+                return 1;
             }
-        }
-        if (!needle[i]) {
-            return 1;
+            p++;
         }
     }
     return 0;
@@ -379,6 +523,11 @@ static int command_line_says_tdj(void) {
 /* same detection spice2x itself uses for the TDJ cabinet */
 static int detect_tdj(void) {
     if (command_line_says_tdj()) {
+        LOG_INFO("TDJ mode: the launcher command line contains an iidxtdj option");
+        return 1;
+    }
+    if (spicecfg_config_says_tdj()) {
+        LOG_INFO("TDJ mode: spicecfg's options file has an iidxtdj option enabled");
         return 1;
     }
     if (file_equals("C:\\000rom.txt", "TDJ-JA")) {
@@ -1342,8 +1491,11 @@ static void write_report(double fps_draw, double fps_swapchain, double fps_prese
     report_append(f, "desktop  : %dHz   game is told %ldHz",
                   g_desktop_refresh, (long)(g_spoof_on ? g_target_fps : g_desktop_refresh));
     if (g_cfg.target_fps == 0) {
-        report_append(f, "cabinet  : auto -> rom files(TDJ)=%s  game rom(/c_drv/000rom.txt)=\"%s\"",
-                      detect_tdj() ? "yes" : "no",
+        report_append(f, "cabinet  : auto -> cmdline=%s spicecfg=%s romfiles=%s game rom=\"%s\"",
+                      command_line_says_tdj() ? "TDJ" : "no",
+                      spicecfg_config_says_tdj() ? "TDJ" : "no",
+                      (file_equals("C:\\000rom.txt", "TDJ-JA") ||
+                       file_equals("D:\\001rom.txt", "TDJ")) ? "TDJ" : "no",
                       g_rom_content[0] ? g_rom_content : "(not readable)");
     } else {
         report_append(f, "cabinet  : fixed at %d fps in " INI_NAME, g_cfg.target_fps);

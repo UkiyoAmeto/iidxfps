@@ -67,19 +67,28 @@ IIDX 的游戏逻辑是**"每次主循环推进一帧"**，没有任何基于真
 
 ### `FPS=auto` 是怎么判断 TDJ / LDJ 的
 
-按顺序试三个信号，任意一个成立就算 TDJ（120 帧）：
+按顺序试四个信号，任意一个成立就算 TDJ（120 帧）：
 
-1. **启动命令行**里有没有 `iidxtdj`（`-iidxtdj`、`-iidxtdjw`、`-iidxtdjsubsize` … 这些
-   TDJ 专用参数都含这个串，LDJ 没有）。这条是**立刻**可得的，所以在游戏枚举显示模式之前
-   就已经确定，整张模式表和刷新率欺骗从第一帧起就是一致的。
-2. `C:\000rom.txt` 内容为 `TDJ-JA`，或 `D:\001rom.txt` 内容为 `TDJ`（spice2x 自己也读这两个文件）。
-3. **游戏自己读的机台 ROM**（`/c_drv/000rom.txt`）——通过 `avs2-core.dll` 调同一个 AVS 文件系统
+1. **启动命令行**里有没有 TDJ 模式开关（`-iidxtdj` / `-iidxtdjw` / `-sp2x-iidxtdjw`）。
+   只认这几个模式开关本身，像 `-iidxtdjcamhook`、`-iidxtdjsubsize` 这种"名字里带 tdj 的设置项"
+   不算（它们关掉 TDJ 之后还会留在配置里）。
+2. **spicecfg 配置文件**（`%APPDATA%\spicetools.xml`，可用 ini 里的 `SpiceCfgPath` 指定）。
+   在 spicecfg 界面里勾选 TDJ 就存在这里。注意 spice2x 的布尔选项是**值非空才算启用**：
+   `<option name="iidxtdj" value="1"/>` 是开，`value=""` 是关。
+   （这一条和命令行一样是**立刻**可得的，所以游戏枚举显示模式之前就已经确定，
+   整张模式表和刷新率欺骗从第一帧起就是一致的。）
+3. `C:\000rom.txt` 内容为 `TDJ-JA`，或 `D:\001rom.txt` 内容为 `TDJ`（spice2x 自己也读这两个文件）。
+4. **游戏自己读的机台 ROM**（`/c_drv/000rom.txt`）——通过 `avs2-core.dll` 调同一个 AVS 文件系统
    去读（spice2x 在 TDJ 模式下是把这份 ROM 注入到内存里的，硬盘上没有文件；`avs2-core.dll`
    的导出名是混淆的且随版本变化，模块会把 spice2x 认识的所有命名都试一遍）。
    这一步在游戏自己的线程上做（`EnumDisplaySettings`、`CreateDevice`、第一帧绘制回调），
    读到之后会重新评估"桌面刷新率已经匹配就不介入"的判断。
 
-报告文件里的 `cabinet:` 行会同时列出这三个信号的实际结果，方便排查。
+报告文件里的 `cabinet:` 行会把四个信号的实际结果都列出来，方便排查：
+
+```
+cabinet  : auto -> cmdline=TDJ spicecfg=no romfiles=no game rom="TDJ-JA"
+```
 
 
 游戏内快捷键（按住 Ctrl+Shift）：`F9` 切换 120/60，`F10` 开关刷新率欺骗，`F11` 输出状态。
