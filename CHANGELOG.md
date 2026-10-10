@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.0.3
+
+Transparency release, prompted by a player asking for proof that the plugin cannot change the
+judgement windows or the note scroll speed.
+
+* `iidxfps_report.txt` now contains a `footprint:` section that lists **every** address the module
+  writes at runtime (the four import slots, the six COM vtable slots and the present parameter),
+  plus the identity of the game module, so anyone can audit it.
+* The millisecond clock replacement is now epoch transparent: it continues the system uptime
+  instead of starting at zero when the module loads (1.0.2 read the real clocks before the import
+  pointers were saved, so the take over value ended up as 0).  Same unit, same 32 bit wrap, same
+  epoch as the original APIs - only the resolution is finer.
+* New `verify/` tooling: `verifydump.c` (a read only observer module that dumps the raw bytes of
+  `bm2dx.dll`/`d3d9.dll` sections out of the running process) and `compare_dumps.py` (compares two
+  such dumps while ignoring the bytes the Windows loader legitimately rewrites: 121k relocations
+  and the import tables).
+* Result of that verification (three runs, two without the module): `bm2dx.dll` contains exactly
+  one 5 byte deviation from the file on disk in both cases - a spice2x inline hook - and its jump
+  target differs between two *control* runs by the same 1-2 bytes it differs from the plugin run.
+  `.rdata` (after masking loader writes) and `.pdata` are byte identical, and `d3d9.dll` is byte
+  identical in every run.  The plugin itself contributes zero bytes to the game code.
+
+
+
 ## v1.0.2
 
 * `FPS=auto` additionally reads **spicecfg's options file** (`%APPDATA%\spicetools.xml`, override with

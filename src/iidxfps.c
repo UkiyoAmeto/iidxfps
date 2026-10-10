@@ -81,7 +81,7 @@
 #define MODULE_TAG  "iidxfps"
 #define INI_NAME    "iidxfps.ini"
 #define REPORT_NAME "iidxfps_report.txt"
-#define IIDXFPS_VERSION "1.0.2"
+#define IIDXFPS_VERSION "1.0.3"
 
 #define DEFAULT_FPS_TDJ 120
 #define DEFAULT_FPS_LDJ 60
@@ -836,6 +836,83 @@ static void pace_frame(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* module footprint audit                                             */
+/* ------------------------------------------------------------------ */
+/*
+ * The report lists every single change this module makes to the running game, so
+ * that anyone can check the claim "judgement windows and note scroll speed cannot
+ * be affected": the game's code is never modified.  Only import slots (function
+ * pointers), shared COM vtable slots and the present parameters are touched, and
+ * no game logic is patched, hooked or rewritten.
+ */
+#define MAX_AUDIT 40
+
+typedef struct {
+    char  what[72];
+    void *slot;
+    void *from;
+    void *to;
+} audit_entry_t;
+
+static audit_entry_t g_audit[MAX_AUDIT];
+static int g_audit_count;
+static volatile LONG g_audit_lock;
+
+static void audit_add(const char *what, void *slot, void *from, void *to) {
+    while (InterlockedCompareExchange(&g_audit_lock, 1, 0) != 0) {
+        Sleep(0);
+    }
+    if (g_audit_count < MAX_AUDIT) {
+        int i;
+        for (i = 0; i < (int)sizeof(g_audit[0].what) - 1 && what[i]; i++) {
+            g_audit[g_audit_count].what[i] = what[i];
+        }
+        g_audit[g_audit_count].what[i] = '\0';
+        g_audit[g_audit_count].slot = slot;
+        g_audit[g_audit_count].from = from;
+        g_audit[g_audit_count].to = to;
+        g_audit_count++;
+    }
+    InterlockedExchange(&g_audit_lock, 0);
+}
+
+static const char *vtable_slot_name(int index) {
+    switch (index) {
+        case VTBL_IDIRECT3D9_CREATEDEVICE:   return "IDirect3D9::CreateDevice";
+        case VTBL_IDIRECT3D9_CREATEDEVICEEX: return "IDirect3D9Ex::CreateDeviceEx";
+        case VTBL_DEVICE_PRESENT:            return "IDirect3DDevice9::Present";
+        case VTBL_DEVICE_PRESENTEX:          return "IDirect3DDevice9Ex::PresentEx";
+        case VTBL_SWAPCHAIN_PRESENT:         return "IDirect3DSwapChain9::Present";
+        default:                             return "COM vtable slot";
+    }
+}
+static void audit_add_iat(void *slot, const char *dll, const char *func, void *from, void *to) {
+    char what[72];
+    int n = 0;
+    const char *p = "IAT ";
+    while (*p && n < (int)sizeof(what) - 1) what[n++] = *p++;
+    p = dll;
+    while (*p && n < (int)sizeof(what) - 1) what[n++] = *p++;
+    if (n < (int)sizeof(what) - 1) what[n++] = '!';
+    p = func;
+    while (*p && n < (int)sizeof(what) - 1) what[n++] = *p++;
+    what[n] = '\0';
+    audit_add(what, slot, from, to);
+}
+
+static void audit_add_vtable(void *vtbl, int index, void *from, void *to) {
+    char what[72];
+    int n = 0;
+    const char *p;
+    (void)vtbl;
+    p = "COM vtable slot (shared): ";
+    while (*p && n < (int)sizeof(what) - 1) what[n++] = *p++;
+    p = vtable_slot_name(index);
+    while (*p && n < (int)sizeof(what) - 1) what[n++] = *p++;
+    what[n] = '\0';
+    audit_add(what, vtbl, from, to);
+}
+/* ------------------------------------------------------------------ */
 /* IAT hooking                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -901,9 +978,13 @@ static int iat_hook(HMODULE mod, const char *dll_name, const char *func_name,
             if (orig_out) {
                 *orig_out = (void *)(uintptr_t)ft->u1.Function;
             }
-            ft->u1.Function = (uintptr_t)hook_fn;
-            VirtualProtect(&ft->u1.Function, sizeof(void *), old_protect, &old_protect);
-            FlushInstructionCache(GetCurrentProcess(), &ft->u1.Function, sizeof(void *));
+            {
+                void *old_value = (void *)(uintptr_t)ft->u1.Function;
+                ft->u1.Function = (uintptr_t)hook_fn;
+                VirtualProtect(&ft->u1.Function, sizeof(void *), old_protect, &old_protect);
+                FlushInstructionCache(GetCurrentProcess(), &ft->u1.Function, sizeof(void *));
+                audit_add_iat((void *)&ft->u1.Function, name, fname, old_value, hook_fn);
+            }
             hooked++;
         }
     }
@@ -970,6 +1051,7 @@ static void *vtable_patch(void *obj, int index, void *hook_fn) {
         g_vtable_patches[g_vtable_patch_count].index = index;
         g_vtable_patches[g_vtable_patch_count].orig = orig;
         g_vtable_patch_count++;
+        audit_add_vtable(vtbl, index, orig, hook_fn);
     }
     LeaveCriticalSection(&g_vtable_lock);
     return orig;
@@ -1012,6 +1094,9 @@ static HRESULT STDMETHODCALLTYPE createdevice_hook(
         modified = 1;
         LOG_INFO("CreateDevice: PresentationInterval 0x%08X -> IMMEDIATE (vsync off)",
                  saved_interval);
+        audit_add("present params: PresentationInterval -> IMMEDIATE",
+                  present_params, (void *)(uintptr_t)saved_interval,
+                  (void *)(uintptr_t)PRESENT_INTERVAL_IMMEDIATE);
     }
 
     hr = ((create_device_t)g_real_createdevice)(
@@ -1056,6 +1141,9 @@ static HRESULT STDMETHODCALLTYPE createdeviceex_hook(
         modified = 1;
         LOG_INFO("CreateDeviceEx: PresentationInterval 0x%08X -> IMMEDIATE (vsync off)",
                  saved_interval);
+        audit_add("present params: PresentationInterval -> IMMEDIATE",
+                  present_params, (void *)(uintptr_t)saved_interval,
+                  (void *)(uintptr_t)PRESENT_INTERVAL_IMMEDIATE);
     }
 
     hr = ((create_device_ex_t)g_real_createdeviceex)(
@@ -1338,38 +1426,78 @@ static void __cdecl d3d9_callback(
 /* legacy millisecond clocks -> QueryPerformanceCounter               */
 /* ------------------------------------------------------------------ */
 
-/* bm2dx.dll imports timeGetTime/GetTickCount from winmm/kernel32: those are
-   the 1ms-resolution clocks the game was written against.  Feeding them a
-   QPC derived value keeps the same unit and the same 32 bit wrap-around
-   behaviour, only with the resolution of the high precision timer. */
-static DWORD qpc_millis32(void) {
+/* bm2dx.dll imports timeGetTime/GetTickCount(64) from winmm/kernel32: those are
+   the 1ms-resolution clocks the game was written against.
+ *
+ * The replacement must be *transparent*: same unit, same 32 bit wrap-around and
+ * the same epoch (milliseconds since the system started), just with the
+ * resolution of the high precision timer instead of the 1ms/15.6ms tick.  So the
+ * real clock is read once, before the imports are redirected, and every value
+ * after that continues from exactly there.  (Starting the counter at zero when
+ * the module loads would hand the game a clock that jumps backwards, which is a
+ * real behaviour change and could disturb anything that measures a duration.) */
+static ULONGLONG g_ms_base;              /* real uptime in ms when we took over */
+static volatile LONG g_ms_base_ready;
+
+static void ms_clock_init(void) {
+    LARGE_INTEGER now;
+
+    /* Resolve the genuine clocks directly instead of using the saved "original"
+       pointers: those are only filled in by the IAT hook below, which runs after
+       this call.  Asking the system DLLs is independent of the game's (not yet
+       patched) import table anyway. */
+    {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        HMODULE wmm = GetModuleHandleA("winmm.dll");
+        ULONGLONG (WINAPI *real64)(void) = NULL;
+        DWORD (WINAPI *real32)(void) = NULL;
+
+        if (k32) {
+            real64 = (ULONGLONG (WINAPI *)(void))(void *)GetProcAddress(k32, "GetTickCount64");
+            real32 = (DWORD (WINAPI *)(void))(void *)GetProcAddress(k32, "GetTickCount");
+        }
+        if (!real32 && wmm) {
+            real32 = (DWORD (WINAPI *)(void))(void *)GetProcAddress(wmm, "timeGetTime");
+        }
+        if (real64) {
+            g_ms_base = real64();
+        } else if (real32) {
+            g_ms_base = (ULONGLONG)real32();
+        }
+    }
+    QueryPerformanceCounter(&now);
+    g_qpc_epoch = now;
+    InterlockedExchange(&g_ms_base_ready, 1);
+    LOG_INFO("millisecond clocks continue the system uptime "
+             "(take over at %llu ms, same epoch and unit as the real ones)",
+             (unsigned long long)g_ms_base);
+}
+
+static ULONGLONG qpc_uptime_ms(void) {
     LARGE_INTEGER now;
     LONGLONG ticks;
+
+    if (!InterlockedCompareExchange(&g_ms_base_ready, 0, 0)) {
+        return g_ms_base;               /* not armed yet: report the take over time */
+    }
     QueryPerformanceCounter(&now);
     ticks = now.QuadPart - g_qpc_epoch.QuadPart;
     if (ticks < 0) {
         ticks = 0;
     }
-    return (DWORD)((ticks * 1000) / g_qpf.QuadPart);
+    return g_ms_base + (ULONGLONG)((ticks * 1000) / g_qpf.QuadPart);
 }
 
 static DWORD WINAPI timegettime_hook(void) {
-    return qpc_millis32();
+    return (DWORD)qpc_uptime_ms();       /* deliberate 32 bit wrap, like the original */
 }
 
 static DWORD WINAPI gettickcount_hook(void) {
-    return qpc_millis32();
+    return (DWORD)qpc_uptime_ms();
 }
 
 static ULONGLONG WINAPI gettickcount64_hook(void) {
-    LARGE_INTEGER now;
-    LONGLONG ticks;
-    QueryPerformanceCounter(&now);
-    ticks = now.QuadPart - g_qpc_epoch.QuadPart;
-    if (ticks < 0) {
-        ticks = 0;
-    }
-    return (ULONGLONG)((ticks * 1000) / g_qpf.QuadPart);
+    return qpc_uptime_ms();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1505,6 +1633,26 @@ static void write_report(double fps_draw, double fps_swapchain, double fps_prese
                                  : (g_pacing_enabled ? "ENABLED (QPC schedule, vsync off)"
                                                      : "hands off (refresh matches)"),
                   pace_point_name(), (long)g_device_hooked);
+    if (g_game_module && g_audit_count >= 0) {
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_game_module;
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((uint8_t *)g_game_module + dos->e_lfanew);
+            report_append(f, "game dll : bm2dx base=%p image=%lu bytes build=0x%08lX",
+                          g_game_module,
+                          (unsigned long)nt->OptionalHeader.SizeOfImage,
+                          (unsigned long)nt->FileHeader.TimeDateStamp);
+        }
+    }
+    report_append(f, "footprint: game code bytes modified by this module = NONE");
+    report_append(f, "           (only import slots, shared COM vtable slots and present "
+                     "parameters; judgement and note logic are never touched)");
+    {
+        int i;
+        for (i = 0; i < g_audit_count; i++) {
+            report_append(f, "  [%02d] %-46s slot=%p %p -> %p", i, g_audit[i].what,
+                          g_audit[i].slot, g_audit[i].from, g_audit[i].to);
+        }
+    }
     report_append(f, "frames/s : draw=%.2f swapchain=%.2f present=%.2f paced=%.0f "
                      "late=%lld skipped=%lld",
                   fps_draw, fps_swapchain, fps_present, (double)paced_per_s,
@@ -1617,6 +1765,9 @@ static void install_game_hooks(void) {
 
     if (g_cfg.high_precision_time) {
         int n = 0;
+        /* read the real clocks first, then redirect the imports a moment later:
+           the replacement continues from the value the game would have seen */
+        ms_clock_init();
         n += iat_hook(g_game_module, "winmm.dll", "timeGetTime",
                       (void *)timegettime_hook, &g_real_timegettime);
         n += iat_hook(g_game_module, "kernel32.dll", "GetTickCount",

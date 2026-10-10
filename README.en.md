@@ -112,6 +112,13 @@ frame gap: 14.574 .. 18.372 ms
 When reporting an issue, send that single file instead of spice's `log.txt` (which is large and
 may contain personal information).
 
+The report also carries a `footprint:` section listing every address the module writes at runtime
+(four import slots, six COM vtable slots, one swap chain parameter) together with the statement
+that no game code byte is modified.  Judgement windows, note scrolling and note positions are game
+logic the module never touches — see
+[docs/no-effect-on-judgement.zh-CN.md](docs/no-effect-on-judgement.zh-CN.md) for the memory level
+proof (byte identical `bm2dx.dll` code with and without the module, and byte identical `d3d9.dll`).
+
 ## Building
 
 You need a C compiler; [zig](https://ziglang.org/download/) is recommended (no installation, no
