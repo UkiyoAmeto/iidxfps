@@ -168,6 +168,12 @@ without the module runs at the display refresh rate (120.35).
   send the report file.
 * To hit a rate the display cannot be driven at, the module disables vsync, so **tearing is
   possible**. That is the price of an exact frame rate.
+* **On 144Hz / 165Hz displays the note scroll has a slight judder**: those refresh rates are
+  neither a multiple nor a divisor of the cabinet rate (120 or 60 fps), the game only produces
+  120/60 distinct frames per second and no external tool can invent in-between ones, so every
+  5th frame gets an extra refresh (a 24Hz beat).  Use 120Hz, 60Hz or 240Hz to remove it.  From
+  1.0.4 the module detects this and names the rate to switch to
+  (see [docs/how-it-works.zh-CN.md](docs/how-it-works.zh-CN.md) section 8).
 * Do not combine it with RTSS or driver level frame limiters (the slowest one wins).
 * "Render at 144 while the logic runs at 60" cannot be done by this module — see
   [docs/how-it-works.zh-CN.md](docs/how-it-works.zh-CN.md) (Chinese). In one line: IIDX counts

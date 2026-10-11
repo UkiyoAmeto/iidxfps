@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.0.4
+
+Answers the "notes look like jelly on my 144Hz monitor" report.
+
+* Refresh rate compatibility check.  The game renders exactly `target` distinct frames per second
+  and no external tool can invent the missing ones, so a display whose rate is neither an integer
+  multiple nor an integer divisor of the target shows every 5th frame twice (144Hz with 120 fps is
+  1.2 refreshes per frame, i.e. a 24Hz beat).  The module now detects that, logs the ratio and the
+  beat, enumerates the rates the panel really offers at the current resolution and names the one to
+  switch to; both lines also appear in the report as `refresh:` and `advice:`.
+* Frame interval telemetry now also works when the pace point is the swap chain or the device
+  present.  Spice builds without `register_d3d9` (older ones) never fire the draw callback, and the
+  gap statistics were only collected there, so such reports showed `frame gap: 0.000 .. 0.000 ms` -
+  no jitter data at all.  The draw callback owns the measurement whenever it exists, otherwise the
+  pacing call records it, never both (recording in both halves the reported gaps).
+* Short in-frame calls are filtered out of the gap statistics.
+
+
+
 ## v1.0.3
 
 Transparency release, prompted by a player asking for proof that the plugin cannot change the

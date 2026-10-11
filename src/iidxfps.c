@@ -81,7 +81,7 @@
 #define MODULE_TAG  "iidxfps"
 #define INI_NAME    "iidxfps.ini"
 #define REPORT_NAME "iidxfps_report.txt"
-#define IIDXFPS_VERSION "1.0.3"
+#define IIDXFPS_VERSION "1.0.4"
 
 #define DEFAULT_FPS_TDJ 120
 #define DEFAULT_FPS_LDJ 60
@@ -659,7 +659,10 @@ static int avs_read_cabinet_rom(char *buf, size_t bufsz) {
 /* ------------------------------------------------------------------ */
 
 static int g_desktop_refresh;   /* defined further down */
+static char g_refresh_fit[128];  /* "144Hz / 120 fps = 1.20 refreshes per frame" */
+static char g_refresh_advice[256];
 static void decide_pacing(void);
+static void analyse_refresh_fit(void);
 
 static void set_target_fps(int fps, const char *why) {
     int old = (int)g_target_fps;
@@ -671,6 +674,7 @@ static void set_target_fps(int fps, const char *why) {
     g_period_ticks = (double)g_qpf.QuadPart / (double)fps;
     g_pacer_started = 0;                   /* re-arm the schedule */
     LOG_INFO("target frame rate %d -> %d fps (%s)", old, fps, why);
+    analyse_refresh_fit();
 }
 
 /* Called once the game is up and running (from the game's own thread), because
@@ -784,12 +788,22 @@ static void wait_until(LONGLONG target) {
 /* the pacer                                                          */
 /* ------------------------------------------------------------------ */
 
+static void record_frame_gap(void);
+
 static void pace_frame(void) {
     LARGE_INTEGER now;
     LONGLONG period;
 
     if (!g_pacing_enabled || g_measure_only) {
         return;
+    }
+    /* Frame interval telemetry.  The spice draw callback is the natural place
+       (exactly one call per game frame) and owns the measurement whenever it
+       exists; the pacing call only records for spice builds without
+       register_d3d9, where the draw callback never fires.  Recording in both
+       would count every frame twice and halve the reported gaps. */
+    if (!InterlockedCompareExchange(&g_draw_seen, 0, 0)) {
+        record_frame_gap();
     }
     period = (LONGLONG)(g_period_ticks + 0.5);
     if (period <= 0) {
@@ -1377,6 +1391,44 @@ static BOOL WINAPI eds_exw_hook(LPCWSTR device, DWORD mode, DEVMODEW *dm, DWORD 
 /* spice2x d3d9 callback: telemetry and draw based pacing fallback    */
 /* ------------------------------------------------------------------ */
 
+/* Frame-to-frame interval statistics, measured at whatever point is really
+   pacing the loop.  The spice draw callback is the natural place, but older
+   spice builds have no register_d3d9, in which case the swap chain (or the
+   device present) is the pace point and the numbers have to come from there -
+   otherwise a report from such a machine has no jitter data at all. */
+static void record_frame_gap(void) {
+    LARGE_INTEGER now;
+    LONGLONG prev;
+    LONGLONG gap;
+
+    QueryPerformanceCounter(&now);
+    prev = (LONGLONG)InterlockedExchange64(&g_ev_last_qpc, now.QuadPart);
+    if (prev <= 0) {
+        return;
+    }
+    gap = now.QuadPart - prev;
+    if (gap <= 0) {
+        return;
+    }
+    /* ignore calls that land inside the same frame (the pace point can fire more
+       than once while the loop is still deciding which instance is the primary
+       one); a real game frame cannot be shorter than a quarter of the period */
+    if (g_period_ticks > 1.0 && (double)gap < g_period_ticks / 4.0) {
+        return;
+    }
+    {
+        LONGLONG mn = (LONGLONG)InterlockedCompareExchange64(&g_ev_min_gap, gap, 0);
+        LONGLONG mx;
+        if (mn == 0 || gap < mn) {
+            InterlockedExchange64(&g_ev_min_gap, gap);
+        }
+        mx = (LONGLONG)InterlockedCompareExchange64(&g_ev_max_gap, gap, 0);
+        if (mx == 0 || gap > mx) {
+            InterlockedExchange64(&g_ev_max_gap, gap);
+        }
+    }
+}
+
 static void __cdecl d3d9_callback(
     SPICE_SDK_D3D9_EVENT event, const SPICE_SDK_D3D9_FRAME *frame, void *userdata) {
     (void)frame;
@@ -1388,26 +1440,7 @@ static void __cdecl d3d9_callback(
     if (event != SPICE_SDK_D3D9_DRAW) {
         return;
     }
-    {
-        LARGE_INTEGER now;
-        LONGLONG prev;
-        QueryPerformanceCounter(&now);
-        prev = (LONGLONG)InterlockedExchange64(&g_ev_last_qpc, now.QuadPart);
-        if (prev > 0) {
-            LONGLONG gap = now.QuadPart - prev;
-            if (gap > 0) {
-                LONGLONG mn = (LONGLONG)InterlockedCompareExchange64(&g_ev_min_gap, gap, 0);
-                LONGLONG mx;
-                if (mn == 0 || gap < mn) {
-                    InterlockedExchange64(&g_ev_min_gap, gap);
-                }
-                mx = (LONGLONG)InterlockedCompareExchange64(&g_ev_max_gap, gap, 0);
-                if (mx == 0 || gap > mx) {
-                    InterlockedExchange64(&g_ev_max_gap, gap);
-                }
-            }
-        }
-    }
+    record_frame_gap();
     InterlockedIncrement64(&g_ev_draw);
     /* The cabinet type is only visible in the rom the game reads while booting.
        It is normally settled in the CreateDevice hook (earlier and before the
@@ -1618,6 +1651,12 @@ static void write_report(double fps_draw, double fps_swapchain, double fps_prese
                   g_spice.register_d3d9 ? "yes" : "no");
     report_append(f, "desktop  : %dHz   game is told %ldHz",
                   g_desktop_refresh, (long)(g_spoof_on ? g_target_fps : g_desktop_refresh));
+    if (g_refresh_fit[0]) {
+        report_append(f, "refresh  : %s", g_refresh_fit);
+    }
+    if (g_refresh_advice[0]) {
+        report_append(f, "advice   : %s", g_refresh_advice);
+    }
     if (g_cfg.target_fps == 0) {
         report_append(f, "cabinet  : auto -> cmdline=%s spicecfg=%s romfiles=%s game rom=\"%s\"",
                       command_line_says_tdj() ? "TDJ" : "no",
@@ -1681,6 +1720,206 @@ static void write_report(double fps_draw, double fps_swapchain, double fps_prese
     CloseHandle(f);
 }
 
+
+/* ------------------------------------------------------------------ */
+/* refresh rate compatibility                                         */
+/* ------------------------------------------------------------------ */
+/*
+ * IIDX counts frames, and no external tool can invent frames the game never
+ * rendered.  So if the display scans out at a rate that is neither an integer
+ * multiple nor an integer divisor of the target, each game frame is shown for a
+ * whole number of refreshes only *on average*: 144Hz with a 120 fps target is
+ * 1.2 refreshes per frame, i.e. a repeating 1,1,1,1,2 pattern whose extra
+ * refresh lands every 5th frame (a 24Hz beat).  Players describe that as the
+ * notes looking like jelly.
+ *
+ * The module cannot fix the arithmetic, but it can say exactly what is wrong
+ * and, when the panel offers a rate that does fit, name it.
+ */
+#define REFRESH_TOLERANCE_PCT 2      /* 59.94 and 119.88 style modes must pass */
+
+static int refresh_is_compatible(int refresh, int target) {
+    int n;
+
+    if (refresh <= 0 || target <= 0) {
+        return 1;                    /* nothing to judge yet */
+    }
+    for (n = 1; n <= 8; n++) {
+        int diff;
+        diff = refresh - n * target;             /* refresh = n x target */
+        if (diff < 0) {
+            diff = -diff;
+        }
+        if (diff * 100 <= target * REFRESH_TOLERANCE_PCT) {
+            return 1;
+        }
+        diff = target - n * refresh;             /* target = n x refresh */
+        if (diff < 0) {
+            diff = -diff;
+        }
+        if (diff * 100 <= refresh * REFRESH_TOLERANCE_PCT) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* score: 0 = 1:1, 1 = refresh is a multiple of the target (each game frame gets
+   n refreshes), 2 = the target is a multiple of the refresh (each refresh shows
+   n game frames).  Lower is better; -1 means not compatible. */
+static int refresh_fit_score(int refresh, int target) {
+    int n;
+
+    if (refresh <= 0 || target <= 0) {
+        return -1;
+    }
+    for (n = 1; n <= 8; n++) {
+        int diff = refresh - n * target;
+        if (diff < 0) {
+            diff = -diff;
+        }
+        if (diff * 100 <= target * REFRESH_TOLERANCE_PCT) {
+            return (n == 1) ? 0 : 1;
+        }
+    }
+    for (n = 2; n <= 8; n++) {
+        int diff = target - n * refresh;
+        if (diff < 0) {
+            diff = -diff;
+        }
+        if (diff * 100 <= refresh * REFRESH_TOLERANCE_PCT) {
+            return 2;
+        }
+    }
+    return -1;
+}
+
+/* Ask user32 directly (our hooks only touch the game's import table) for the
+   refresh rates this panel really offers at the resolution it is running at,
+   and pick the one that fits the target best. */
+static int find_compatible_refresh(int target, int *out_hz) {
+    DEVMODEA dm;
+    DWORD mode = 0;
+    int seen[64];
+    int seen_count = 0;
+    int best = 0;
+    int best_score = 99;
+    DWORD cur_w = 0, cur_h = 0;
+
+    memset(&dm, 0, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) {
+        cur_w = dm.dmPelsWidth;
+        cur_h = dm.dmPelsHeight;
+    }
+    for (mode = 0; mode < 4096; mode++) {
+        int hz, i, dup = 0;
+
+        memset(&dm, 0, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsA(NULL, mode, &dm)) {
+            break;
+        }
+        if (cur_w && cur_h && (dm.dmPelsWidth != cur_w || dm.dmPelsHeight != cur_h)) {
+            continue;                                  /* only this resolution */
+        }
+        hz = (int)dm.dmDisplayFrequency;
+        if (hz <= 0) {
+            continue;
+        }
+        for (i = 0; i < seen_count; i++) {
+            if (seen[i] == hz) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (seen_count < (int)(sizeof(seen) / sizeof(seen[0]))) {
+            seen[seen_count++] = hz;
+        }
+
+        {
+            int score = refresh_fit_score(hz, target);
+            if (score >= 0 && (score < best_score ||
+                               (score == best_score && hz > best))) {
+                best_score = score;
+                best = hz;
+            }
+        }
+    }
+    if (best > 0) {
+        *out_hz = best;
+        return 1;
+    }
+    return 0;
+}
+
+static void analyse_refresh_fit(void) {
+    int refresh = g_desktop_refresh;
+    int target = (int)g_target_fps;
+    int n;
+
+    g_refresh_fit[0] = '\0';
+    g_refresh_advice[0] = '\0';
+    if (refresh <= 0 || target <= 0) {
+        return;
+    }
+    /* express the ratio as "x.xx refreshes per game frame" or, when the target
+       is the faster one, as "x.xx game frames per refresh" */
+    if (refresh >= target) {
+        n = (int)(((double)refresh / (double)target) * 100.0 + 0.5);
+        _snprintf(g_refresh_fit, sizeof(g_refresh_fit) - 1,
+                  "%dHz / %d fps = %d.%02d refreshes per game frame",
+                  refresh, target, n / 100, n % 100);
+    } else {
+        n = (int)(((double)target / (double)refresh) * 100.0 + 0.5);
+        _snprintf(g_refresh_fit, sizeof(g_refresh_fit) - 1,
+                  "%dHz / %d fps = %d.%02d game frames per refresh",
+                  refresh, target, n / 100, n % 100);
+    }
+    g_refresh_fit[sizeof(g_refresh_fit) - 1] = '\0';
+
+    if (refresh_is_compatible(refresh, target)) {
+        return;
+    }
+    {
+        int alt = 0;
+        int beat = (refresh - target < 0 ? target - refresh : refresh - target);
+        if (find_compatible_refresh(target, &alt)) {
+            int score = refresh_fit_score(alt, target);
+            if (score == 0) {
+                _snprintf(g_refresh_advice, sizeof(g_refresh_advice) - 1,
+                          "not an integer ratio: note motion will judder (a %dHz beat). "
+                          "Set the display to %dHz: that is exactly %d fps, 1:1",
+                          beat, alt, target);
+            } else if (score == 1) {
+                int n = (alt + target / 2) / target;
+                _snprintf(g_refresh_advice, sizeof(g_refresh_advice) - 1,
+                          "not an integer ratio: note motion will judder (a %dHz beat). "
+                          "Set the display to %dHz: %d refreshes per game frame, perfectly even",
+                          beat, alt, n);
+            } else {
+                int n = (target + alt / 2) / alt;
+                _snprintf(g_refresh_advice, sizeof(g_refresh_advice) - 1,
+                          "not an integer ratio: note motion will judder (a %dHz beat). "
+                          "Set the display to %dHz: %d game frames per refresh, even motion "
+                          "at a lower refresh rate",
+                          beat, alt, n);
+            }
+        } else {
+            _snprintf(g_refresh_advice, sizeof(g_refresh_advice) - 1,
+                      "not an integer ratio: note motion will judder (a %dHz beat) and this "
+                      "monitor offers no compatible rate at this resolution; use a 120Hz or "
+                      "240Hz display, or a resolution that can run at one of those",
+                      (refresh - target < 0 ? target - refresh : refresh - target));
+        }
+        g_refresh_advice[sizeof(g_refresh_advice) - 1] = '\0';
+        LOG_WARN("%s", g_refresh_fit);
+        LOG_WARN("%s", g_refresh_advice);
+    }
+}
 
 static void log_display_state(void) {
     DEVMODEA dm;
@@ -1805,6 +2044,7 @@ static unsigned __stdcall worker_thread(void *arg) {
     resolve_target_fps();
     log_display_state();
     decide_pacing();
+    analyse_refresh_fit();
 
     install_game_hooks();
 
